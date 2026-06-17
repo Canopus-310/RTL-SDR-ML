@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# Large data files (regenerable)
+*.wav
+*.bin
+capture.bin
+
+# Generated reports and scan outputs
+rf_scan_*.json
+rf_threat_report_*.json
+rf_threat_report_*.txt
+
+# Allow example outputs
+!Examples/*
+
+# OS files
+.DS_Store
+Thumbs.db

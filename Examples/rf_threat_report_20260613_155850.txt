@@ -1,0 +1,104 @@
+============================================================
+RF DRONE THREAT ASSESSMENT REPORT
+============================================================
+
+SCAN DETAILS
+------------------------------------------------------------
+Tool:         RTL-SDR Drone RF Signal Classifier
+Recording:    synthetic_drone_telemetry.wav
+Center Freq:  433.900 MHz
+Sample Rate:  2.4 MS/s
+Duration:     5.0s
+Samples:      12,000,000
+Noise Floor:  -90.0 dB
+Date:         2026-06-13 15:58:50
+
+THREAT SUMMARY
+------------------------------------------------------------
+Overall:           ELEVATED — signals consistent with drone activity
+Max Threat Score:  61/100
+Signals Found:     4
+Drone Candidates:  4
+By Severity:       MEDIUM: 3, HIGH: 1
+
+DETAILED DETECTIONS
+------------------------------------------------------------
+
+  Signal 1: 433.887 MHz
+  ..................................................
+  Power:          -77.2 dB
+  Bandwidth:      230.3 kHz
+  ML Class:       DRONE_VIDEO (51%)
+  Fingerprint:    SiK Telemetry Radio (433 MHz) (40/100)
+  Threat Score:   54/100 (MEDIUM)
+  Risk Factors:
+    [+25] FREQUENCY: Signal at 433.9 MHz is in 433 MHz ISM band — Primary band for drone telemetry (SiK radios, DragonLink)
+    [+12] ML_CLASSIFICATION: ML classifier identified signal as DRONE_VIDEO (51% confidence)
+    [+12] FINGERPRINT: Matches known drone profile: SiK Telemetry Radio (433 MHz) (match score 40/100)
+    [ +5] COMBINED_RISK: Signal is in a drone band AND matches a known drone profile — high correlation
+  Recommendations:
+    - WARNING: SiK Telemetry Radio (433 MHz) uses unencrypted MAVLink protocol — vulnerable to interception and spoofing
+    - MAVLink telemetry link detected — drone flight data, GPS position, and commands may be exposed if link is unencrypted
+    - Continue monitoring — re-scan in 5 minutes
+    - Check if authorized drone operations are scheduled
+
+  Signal 2: 433.955 MHz
+  ..................................................
+  Power:          -45.3 dB
+  Bandwidth:      29.9 kHz
+  ML Class:       FM_BROADCAST (62%)
+  Fingerprint:    SiK Telemetry Radio (433 MHz) (70/100)
+  Threat Score:   61/100 (HIGH)
+  Risk Factors:
+    [+25] FREQUENCY: Signal at 434.0 MHz is in 433 MHz ISM band — Primary band for drone telemetry (SiK radios, DragonLink)
+    [ +0] ML_CLASSIFICATION: ML classifier identified signal as FM_BROADCAST (62%) — not consistent with drone activity
+    [+21] FINGERPRINT: Matches known drone profile: SiK Telemetry Radio (433 MHz) (match score 70/100)
+    [ +5] BANDWIDTH: Narrow bandwidth (30 kHz) consistent with telemetry/control link
+    [ +5] PROXIMITY: Strong signal (-45 dB) suggests transmitter is in close proximity
+    [ +5] COMBINED_RISK: Signal is in a drone band AND matches a known drone profile — high correlation
+  Recommendations:
+    - WARNING: SiK Telemetry Radio (433 MHz) uses unencrypted MAVLink protocol — vulnerable to interception and spoofing
+    - MAVLink telemetry link detected — drone flight data, GPS position, and commands may be exposed if link is unencrypted
+    - Conduct visual scan of the area for drone activity
+    - Log signal details for incident report
+    - Consider continuous monitoring of this frequency band
+
+  Signal 3: 433.999 MHz
+  ..................................................
+  Power:          -74.3 dB
+  Bandwidth:      230.3 kHz
+  ML Class:       DRONE_VIDEO (51%)
+  Fingerprint:    SiK Telemetry Radio (433 MHz) (40/100)
+  Threat Score:   54/100 (MEDIUM)
+  Risk Factors:
+    [+25] FREQUENCY: Signal at 434.0 MHz is in 433 MHz ISM band — Primary band for drone telemetry (SiK radios, DragonLink)
+    [+12] ML_CLASSIFICATION: ML classifier identified signal as DRONE_VIDEO (51% confidence)
+    [+12] FINGERPRINT: Matches known drone profile: SiK Telemetry Radio (433 MHz) (match score 40/100)
+    [ +5] COMBINED_RISK: Signal is in a drone band AND matches a known drone profile — high correlation
+  Recommendations:
+    - WARNING: SiK Telemetry Radio (433 MHz) uses unencrypted MAVLink protocol — vulnerable to interception and spoofing
+    - MAVLink telemetry link detected — drone flight data, GPS position, and commands may be exposed if link is unencrypted
+    - Continue monitoring — re-scan in 5 minutes
+    - Check if authorized drone operations are scheduled
+
+  Signal 4: 434.038 MHz
+  ..................................................
+  Power:          -79.2 dB
+  Bandwidth:      230.3 kHz
+  ML Class:       DRONE_VIDEO (51%)
+  Fingerprint:    SiK Telemetry Radio (433 MHz) (40/100)
+  Threat Score:   54/100 (MEDIUM)
+  Risk Factors:
+    [+25] FREQUENCY: Signal at 434.0 MHz is in 433 MHz ISM band — Primary band for drone telemetry (SiK radios, DragonLink)
+    [+12] ML_CLASSIFICATION: ML classifier identified signal as DRONE_VIDEO (51% confidence)
+    [+12] FINGERPRINT: Matches known drone profile: SiK Telemetry Radio (433 MHz) (match score 40/100)
+    [ +5] COMBINED_RISK: Signal is in a drone band AND matches a known drone profile — high correlation
+  Recommendations:
+    - WARNING: SiK Telemetry Radio (433 MHz) uses unencrypted MAVLink protocol — vulnerable to interception and spoofing
+    - MAVLink telemetry link detected — drone flight data, GPS position, and commands may be exposed if link is unencrypted
+    - Continue monitoring — re-scan in 5 minutes
+    - Check if authorized drone operations are scheduled
+
+============================================================
+END OF REPORT
+============================================================

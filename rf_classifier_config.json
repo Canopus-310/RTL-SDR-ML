@@ -1,0 +1,23 @@
+{
+  "features": [
+    "bandwidth_hz",
+    "peak_power_db",
+    "snr_db",
+    "spectral_flatness",
+    "amp_variation",
+    "amp_kurtosis",
+    "freq_std_hz",
+    "freq_range_hz",
+    "duty_cycle",
+    "num_spectral_peaks"
+  ],
+  "classes": [
+    "FM_BROADCAST",
+    "DRONE_TELEMETRY",
+    "DRONE_VIDEO",
+    "INTERFERENCE",
+    "NOISE"
+  ],
+  "accuracy": 1.0,
+  "sample_rate": 2400000
+}
