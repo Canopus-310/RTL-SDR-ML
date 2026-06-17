@@ -152,6 +152,7 @@ The threat assessment scores each detected signal across multiple factors: frequ
 ## Limitations and Honest Notes
 
 - **Synthetic training data:** The ML model is trained on synthetic signals. It achieves high accuracy on synthetic test data but shows reduced confidence (~50–65%) on real-world captures — a demonstration of the domain gap between synthetic and real RF data. Real-world deployment would benefit from retraining on captured samples.
+- **Real-world validation:** Testing has been done on real FM broadcast captures (104 MHz) and synthetic signals at drone bands (433/915 MHz). The pipeline is designed for sub-GHz ISM monitoring but has not been tested on actual captured drone RF data.
 - **Sidelobe detection:** The detector can pick up spectral sidelobes of strong signals as separate detections.
 - **LoRa systems overlap:** Crossfire, ExpressLRS, and FrSky R9 share frequency bands and can't be distinguished by frequency alone — the fingerprint matcher reports all plausible matches.
 - **Receive-only:** This is a passive monitoring tool. The RTL-SDR cannot transmit.
