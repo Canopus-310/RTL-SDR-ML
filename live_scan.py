@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument("--gain", type=float, default=15,
                         help="tuner gain in dB, snapped to the nearest step the tuner "
                              "supports (default: 15)")
-    parser.add_argument("--duration", type=float, default=5,
+    parser.add_argument("--duration", type=float, default=2,
                         help="seconds of IQ to capture per scan (default: 5)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--loop", action="store_true",
