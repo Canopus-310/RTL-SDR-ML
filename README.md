@@ -104,6 +104,9 @@ python live_scan.py --loop                         # rescan until Ctrl+C
 | `--loop` | off | Repeat scans until Ctrl+C; the dongle is closed cleanly on exit. |
 | `--stream` | off | Continuous mode (see below). Can't be combined with `--loop` or `--save-wav`; `--duration` is ignored. |
 | `--save-wav` | off | Save each capture as `baseband_<freq>Hz_<HH-MM-SS>_<DD-MM-YYYY>.wav` (stereo Int16, same as SDR++'s baseband recorder), so it can be re-analyzed with `rf_scanner.py`. |
+| `--model` | `rf` | Classifier. `rf` is the deployed Random Forest (`rf_classifier_model.joblib`). `rf_tuned`, `xgb`, `lgbm`, `cat` and `ensemble` load `models/<name>.joblib` written by `compare_models.py`. All return class names, so nothing else changes. |
+| `--plot` | off | Save spectrum and waterfall plots (PNG at 300 dpi + PDF) to `results/spectra/` without opening a window. In `--stream`, one session pair is saved on Ctrl+C. |
+| `--plot-every N` | off | `--stream` only (implies `--plot`): also save a snapshot pair every N blocks from a background thread. |
 
 Each scan discards the first 0.2 s after tuning (PLL settling and stale USB buffer data), reads in 256k-sample chunks, and writes the usual `rf_threat_report_<timestamp>.json/.txt`. Manual gain is used and the RTL2832 digital AGC is off, so levels are comparable between scans.
 
@@ -120,6 +123,19 @@ A reader thread captures 0.5 s IQ blocks into a two-block queue while the main t
 Detections are grouped into **tracks**: a detection joins the nearest track within 20 kHz. A frequency-hopping emitter is a single track listing the channels seen, hops per second and dwell time, and the stream summary report includes this. Single-channel hops seen in a block are counted towards an emitter already recognised on that channel. The live table shows, per track, the frequency, first/last seen, hits out of blocks spanned, presence %, burstiness and the highest threat score seen. On Ctrl+C a summary is written to `rf_threat_report_stream_<timestamp>.json/.txt`, including the highest-threat detection of each track. No per-block reports are written.
 
 **Burstiness** is measured the same way in single scans, `--loop` and `--stream`. It is the duty cycle from the burst detector's own on/off times *within* each capture or block, bursty below 50%. The `Duty` column shows a track's median per-block duty cycle (B = bursty, C = continuous); the `LoRa` column shows whether the dechirp rule fired. A hopping link that transmits in every block is still bursty (~15% duty for the synthetic 4-channel hopper), because its on-time is measured, not just whether it appeared in the block.
+
+### Saved plots
+
+With `--plot`, each single or `--loop` scan writes `results/spectra/<YYYYmmdd_HHMMSS>_<freq>Hz_spectrum` and `_waterfall` (each as `.png` and `.pdf`), titled with the frequency, gain, verdict and timestamp:
+
+- **Spectrum:** the Welch average and the max-hold trace (4 ms slices); the two CFAR-style thresholds the detector uses (Welch: median noise + 10 dB; bursts: per-bin noise + the burst threshold); and each detection marked, with its bandwidth shaded (each hop channel for an FHSS emitter).
+- **Waterfall:** the short-time spectrogram, with a box around every detected burst and labels on FHSS channels.
+
+Plot saving is timed as its own stage ("Plot saving") in the timing table.
+
+In `--stream`, plotting never runs per block. With `--plot`, the session max-hold spectrum and a waterfall of the last ~10 s (from a ring buffer) are saved on Ctrl+C. `--plot-every N` adds snapshots that a background thread draws, so plotting doesn't delay block processing; if the previous snapshot is still being drawn, the new one is skipped rather than waited for.
+
+`capture_spectrum.py` and `signal_detector.py` still open their window, and also save the figure to `results/spectra/` with the same naming. `python spectrum_report.py` saves a combined two-panel figure (spectrum above waterfall) for each test scenario to `results/report/figures/`. By default these are FM, the fixed beacon, the hopping beacon and the beacon off, using the recordings in the repo. Pass `--scenario name=file.wav@freq_hz` to use your own captures.
 
 ### Troubleshooting
 
@@ -181,6 +197,30 @@ python evaluate_dataset.py   # rule vs ML accuracy on labelled real clips in rf_
 
 Each detection's own IQ slice is multiplied by the conjugate reference upchirp for each candidate (SF 7–10, BW 125/250/500 kHz) and FFT'd. A LoRa symbol collapses to a single tone; anything else stays spread. The score is the best peak-to-average ratio in dB above what noise gives. The pipeline prints `LoRa: yes/no (score)` next to the ML label. "Yes" (score ≥ 6 dB, chosen from the `lora_dsp.py` table) adds a `LORA_MODULATION` threat factor (+10) and +10 to LoRa fingerprint profiles. `evaluate_dataset.py` suggests a threshold from real labelled recordings.
 
+### Comparing classifiers and the report
+
+```bash
+python spectrum_report.py     # scenario figures (fig10+) first, so the report includes them
+python compare_models.py      # ~1 h: tune, train and evaluate every model, write figures/tables/report
+python compare_models.py --quick --out <dir> --models-dir <dir>   # few-minute smoke test
+```
+
+`compare_models.py` compares a tuned Random Forest, XGBoost, LightGBM, CatBoost and a soft-voting ensemble (XGBoost + LightGBM + RF). The ensemble is run both with its members calibrated (`CalibratedClassifierCV`) and without. The deployed RF is included as an untouched reference.
+
+The comparison is set up so every model is treated the same:
+- **Data:** the same 11 features (`dsp.py`, the pipeline's own code), data, splits and seeds for every model.
+- **SNR:** training data at in-band SNR uniform 0–30 dB; test steps from −10 to +30 dB (plus −5 and +5). In-band SNR is the signal power over the noise power inside the signal's bandwidth.
+- **Tuning:** a 30-trial random search with 5-fold stratified CV per model.
+- **Seeds:** 3 seeds for the error bands.
+- **Two evaluations:** classifier-only (the true signal slice) and end-to-end (through `detect_regions` and the pipeline's own feature extraction).
+
+What it writes:
+- **Models:** `models/<name>.joblib` (with label encoder and metadata). Load them in the pipeline with `--model`.
+- **CSVs and raw plots:** `results/models/`.
+- **Report:** numbered figures (PNG + PDF) in `results/report/figures/`, Tables 1–5 (CSV + Markdown + LaTeX booktabs) in `results/report/tables/`, and `results/report/model_comparison_report.md` and `.docx`.
+
+Generated datasets are cached in `results/models/cache/`; use `--no-cache` to rebuild them. If labelled WAVs exist in `rf_dataset/lora_hop/` and `rf_dataset/noise/`, they are evaluated too, split by recording session.
+
 ### Generating test signals
 
 To create synthetic recordings for testing without hardware:
@@ -205,6 +245,12 @@ python drone_fingerprints.py
 | `lora_dsp.py` | LoRa chirp generation and the dechirp score |
 | `evaluate_dataset.py` | Rule vs ML accuracy and threshold suggestion on labelled real clips |
 | `stage_timer.py` | Per-stage latency measurement |
+| `dsp.py` | Shared features/detection for experiments (wraps the pipeline's code) + generators with in-band SNR |
+| `models.py` | RF / XGBoost / LightGBM / CatBoost / ensemble builders, label-encoding wrapper, save/load |
+| `compare_models.py` | Model comparison: tuning, metrics, figures, tables, report |
+| `plot_style.py` | Shared figure style, model colours, PNG + PDF saving |
+| `spectrum_plots.py` | Spectrum / waterfall plots for captures, stream sessions and reports |
+| `spectrum_report.py` | Combined scenario figures for the report |
 | `capture_spectrum.py` | Basic IQ capture and spectrum plot |
 | `signal_detector.py` | Auto-detection with spectrogram |
 | `feature_extractor.py` | Rule-based signal classification |

@@ -1,0 +1,35 @@
+{
+  "name": "ensemble",
+  "classes": [
+    "DRONE_TELEMETRY",
+    "DRONE_VIDEO",
+    "FM_BROADCAST",
+    "INTERFERENCE",
+    "LORA",
+    "NOISE"
+  ],
+  "features": [
+    "bandwidth_hz",
+    "peak_power_db",
+    "snr_db",
+    "spectral_flatness",
+    "amp_variation",
+    "amp_kurtosis",
+    "freq_std_hz",
+    "freq_range_hz",
+    "duty_cycle",
+    "num_spectral_peaks",
+    "dechirp_score_db"
+  ],
+  "params": {
+    "members": "xgb + lgbm + rf (tuned params)",
+    "calibration": "isotonic, 5-fold",
+    "voting": "soft"
+  },
+  "cv_macro_f1_mean": 0.9891257544838433,
+  "cv_macro_f1_std": 0.008625795768463201,
+  "seed": 0,
+  "snr_definition": "In-band SNR = P_signal / (N0 x B): signal power while transmitting divided by the noise power inside the signal's occupied bandwidth B (noise is white over the full 2.4 MHz capture).",
+  "created": "2026-11-01T00:33:02.654030",
+  "quick": false
+}

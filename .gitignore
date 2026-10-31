@@ -17,3 +17,6 @@ rf_threat_report_*.txt
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated plots, tables and reports (compare_models.py, spectrum_report.py, live_scan.py --plot)
+results/

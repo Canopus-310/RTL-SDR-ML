@@ -27,9 +27,12 @@ STAGES = [
     ("fingerprint", "Fingerprinting", "fp"),
     ("threat", "Threat assessment", "thr"),
     ("report", "Report writing", "rep"),
+    ("plots", "Plot saving (--plot)", "plt"),
 ]
 PER_SIGNAL_STAGES = ("extraction", "features", "ml", "fingerprint", "threat")
-PROCESSING_STAGES = [key for key, _, _ in STAGES if key != "capture"]
+# Shown (table, JSON) only when they took time, so runs without them look as before
+OPTIONAL_STAGES = ("plots",)
+PROCESSING_STAGES = [key for key, _, _ in STAGES if key not in ("capture",) + OPTIONAL_STAGES]
 
 
 def _fmt_ms(ms):
@@ -66,7 +69,8 @@ class StageTimer:
 
     def as_dict(self, end_to_end_ms=None):
         result = {
-            "stages_ms": {key: round(ms, 2) for key, ms in self.ms.items()},
+            "stages_ms": {key: round(ms, 2) for key, ms in self.ms.items()
+                          if key not in OPTIONAL_STAGES or ms > 0},
             "signals": self.signals,
             "per_signal_stages": list(PER_SIGNAL_STAGES),
             "processing_ms": round(self.processing_ms(), 2),
@@ -80,6 +84,8 @@ class StageTimer:
         lines = [f"  {'Stage':<30}{'Time (ms)':>11}{'% of total':>12}",
                  "  " + "-" * 53]
         for key, label, _ in STAGES:
+            if key in OPTIONAL_STAGES and self.ms[key] == 0:
+                continue
             if key in PER_SIGNAL_STAGES:
                 label += f" (x{self.signals})"
             lines.append(f"  {label:<30}{self.ms[key]:>11.1f}"

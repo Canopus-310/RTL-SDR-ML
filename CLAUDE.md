@@ -14,7 +14,9 @@ pip install -r requirements.txt            # numpy, scipy, scikit-learn, matplot
 python generate_test_signals.py            # writes synthetic_{drone_telemetry,fm_broadcast,interference}.wav (analyze at 433900000) and synthetic_fhss.wav (4-channel hopping LoRa, analyze at 866000000)
 python rf_scanner.py <file.wav> <center_freq_hz>   # full pipeline, e.g. synthetic_drone_telemetry.wav 433900000
 python train_rf_classifier.py              # regenerates rf_classifier_model.joblib + rf_classifier_config.json
-python live_scan.py [--freq HZ] [--gain DB] [--duration S] [--loop | --stream] [--save-wav]   # capture from the dongle via pyrtlsdr (SDR++ must be closed)
+python live_scan.py [--freq HZ] [--gain DB] [--duration S] [--loop | --stream] [--save-wav] [--model rf|rf_tuned|xgb|lgbm|cat|ensemble] [--plot] [--plot-every N]   # capture from the dongle via pyrtlsdr (SDR++ must be closed)
+python spectrum_report.py                  # scenario spectrum/waterfall figures -> results/report/figures/fig10+
+python compare_models.py [--quick --out DIR --models-dir DIR]   # model comparison (~1 h full) -> models/, results/
 
 # Standalone demos / single-stage checks (closest thing to tests)
 python threat_engine.py                    # runs 4 canned assessments through ThreatEngine + DroneFingerprinter
@@ -43,6 +45,12 @@ Run scripts from the repo root: `rf_scanner.py` and `ml_classifier.py` load `rf_
 6. `ScanReport` (`scan_report.py`) collects the detection dicts built in `rf_scanner.main` and saves the JSON + text reports.
 
 **Verdict layer** (`threat_engine.decide_verdict`, applied in `ThreatEngine.assess` and per stream track in `SignalTracker.verdict`) sits on top of the ML and doesn't change it. It needs `lora`, `fhss` (with `hop_rate_hz`), `is_bursty`, `duty_cycle`, `packet_rate_hz`, `dechirp_score_db` and the fingerprint id, so pass those whenever a detection is assessed. The verdict's `VERDICTS[...]["min_score"/"max_score"]` bounds the factor score.
+
+**Detection is shared.** `rf_scanner.detect_regions` (Welch + burst detector + `plan_targets`) and `target_features` are used by `analyze_iq` and by the model comparison (`dsp.py` re-exports them), so end-to-end evaluation runs the real pipeline. `analyze_iq(details={})` returns those products for plotting (`spectrum_plots.py`).
+
+**Models:** `--model rf` (default) is the deployed `rf_classifier_model.joblib`. The other choices are `models.LabeledModel` objects (estimator + LabelEncoder) from `compare_models.py`, which return class names, so the pipeline treats them identically. `models.py` must stay importable for them to load.
+
+**Generated output** goes under `results/` (gitignored). Every figure is saved through `plot_style.save_figure` (300 dpi PNG + PDF) using the shared `MODEL_ORDER`/`MODEL_COLORS`. The "plots" timing stage is optional: it only appears in the table and JSON when it ran, so the default output is unchanged.
 
 ### Invariants to keep in sync
 

@@ -1,8 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 import sys
+from datetime import datetime
 from scipy.io import wavfile
 from scipy.signal import welch, find_peaks
+
+from plot_style import apply_style, save_figure
+
+apply_style()
 
 if len(sys.argv) < 2:
     print("Usage: python signal_detector.py <recording.wav> [center_freq_hz]")
@@ -71,4 +77,8 @@ ax2.set_ylabel("Time (seconds)")
 ax2.set_title("Spectrogram (Waterfall)")
 
 plt.tight_layout()
+# Also save the figure (300 dpi PNG + PDF) before showing the window
+stem = os.path.join("results", "spectra", f"{datetime.now():%Y%m%d_%H%M%S}_{int(round(center_freq))}Hz_spectrum_waterfall")
+for path in save_figure(plt.gcf(), stem):
+    print(f"Saved {os.path.normpath(path)}")
 plt.show()

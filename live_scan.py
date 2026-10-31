@@ -46,6 +46,7 @@ QUEUE_BLOCKS = 2          # blocks buffered before the oldest is dropped
 TRACK_TOLERANCE_KHZ = 20  # a detection joins the nearest track within this distance
 FHSS_CHANNEL_TOLERANCE_KHZ = 50  # a frequency within this of a hop channel belongs to that emitter
 TABLE_ROWS = 20           # live table shows the top tracks by max threat
+MODEL_CHOICES = ["rf", "rf_tuned", "xgb", "lgbm", "cat", "ensemble"]
 # Per-block stages in stream mode (no per-block report), and their summary labels
 STREAM_STAGES = ["detection", "bursts", "extraction", "features", "ml", "fingerprint", "threat"]
 STREAM_STAT_LABELS = {**{key: label for key, label, _ in STAGES},
@@ -80,11 +81,26 @@ def parse_args():
                            "(--duration is ignored)")
     parser.add_argument("--save-wav", action="store_true",
                         help="also save each capture as an SDR++-style Int16 stereo WAV")
+    parser.add_argument("--model", default="rf", choices=MODEL_CHOICES,
+                        help="classifier: rf = deployed Random Forest (default); rf_tuned, xgb, lgbm, "
+                             "cat, ensemble = models/<name>.joblib from compare_models.py")
+    parser.add_argument("--plot", action="store_true",
+                        help="save spectrum + waterfall plots to results/spectra/ (no window). "
+                             "--stream: one session pair on Ctrl+C")
+    parser.add_argument("--plot-every", type=int, default=0, metavar="N",
+                        help="--stream only: also save a snapshot pair every N blocks from a "
+                             "background thread (implies --plot)")
     args = parser.parse_args()
     if args.duration <= 0:
         parser.error("--duration must be greater than 0")
     if args.stream and args.save_wav:
         parser.error("--save-wav is not supported with --stream")
+    if args.plot_every:
+        if not args.stream:
+            parser.error("--plot-every needs --stream")
+        if args.plot_every < 1:
+            parser.error("--plot-every must be at least 1")
+        args.plot = True
     return args
 
 
@@ -192,10 +208,18 @@ def run_scan(sdr, center_freq, args, clf, fingerprinter):
 
     # Fresh engine per scan so the summary only covers this capture
     threat_engine = ThreatEngine()
+    details = {} if args.plot else None
     detections, noise_floor = analyze_iq(iq, sample_rate, center_freq,
-                                         clf, fingerprinter, threat_engine, timer=timer)
+                                         clf, fingerprinter, threat_engine, timer=timer, details=details)
     json_name, _ = report_scan(source, center_freq, sample_rate, len(iq),
                                detections, noise_floor, threat_engine, timer=timer)
+    if args.plot:
+        from spectrum_plots import save_capture_plots
+        with timer.stage("plots"):
+            plot_paths = save_capture_plots(details, detections, center_freq, float(sdr.gain), started)
+        print("\n[OK] Plots saved:")
+        for path in plot_paths:
+            print(f"     {os.path.normpath(path)}")
     end_to_end_ms = timer.elapsed_ms()
 
     add_timings_to_report(json_name, timer.as_dict(end_to_end_ms))
@@ -582,8 +606,20 @@ def save_stream_summary(tracker, stream, metadata):
     return json_name, txt_name
 
 
-def run_stream(sdr, reader, center_freq, clf, fingerprinter):
-    """Analyze blocks from the reader as they arrive and keep a live track table until Ctrl+C."""
+def track_detections(tracker):
+    """Each track's highest-threat detection, with the track's verdict (for plot markers)."""
+    return [{**t["best"], "verdict": tracker.verdict(t)[0], "threat_score": tracker.threat(t)}
+            for t in tracker.ranked()]
+
+
+def run_stream(sdr, reader, center_freq, clf, fingerprinter, plot=False, plot_every=0):
+    """
+    Analyze blocks from the reader as they arrive and keep a live track table until Ctrl+C.
+
+    plot: keep the session max-hold and the last ~10 s of blocks, and save one
+    spectrum + waterfall pair on exit. plot_every: also hand a snapshot to a
+    background PlotWorker every N blocks (never waits for it).
+    """
     sample_rate = int(sdr.sample_rate)
     gain = sdr.gain
     # One sample per predict call: a worker pool per call (n_jobs=-1) costs ~1 s per block
@@ -593,6 +629,15 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
     block_timings = []  # per analyzed block: {stage: ms, "processing": ms, "latency": ms}
     live = enable_ansi()
     started = datetime.now()
+    session = worker = None
+    stages = STREAM_STAGES
+    if plot:
+        from spectrum_plots import PlotWorker, SessionPlotter
+        session = SessionPlotter(center_freq, BLOCK_SECONDS)
+        stages = STREAM_STAGES + ["plots"]
+        if plot_every:
+            worker = PlotWorker()
+            worker.start()
 
     print(f"\n[*] Streaming {BLOCK_SECONDS:g}s blocks at {center_freq/1e6:.3f} MHz "
           f"- Ctrl+C to stop and write the summary report")
@@ -609,11 +654,17 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
 
             timer = StageTimer()  # processing clock starts here
             timer.add("capture", capture_ms)
+            details = {} if session else None
             detections, noise_floor = analyze_iq(
                 iq, sample_rate, center_freq, clf, fingerprinter, ThreatEngine(),
-                verbose=False, timer=timer)
-            processing_ms.append(timer.elapsed_ms())
+                verbose=False, timer=timer, details=details)
             tracker.update(detections, captured_at)
+            if session:
+                with timer.stage("plots"):
+                    session.update(details, captured_at)
+                    if worker and tracker.blocks_analyzed % plot_every == 0:
+                        worker.submit(session.snapshot(track_detections(tracker), gain, datetime.now()))
+            processing_ms.append(timer.elapsed_ms())
 
             screen = []
             if live:
@@ -625,7 +676,7 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
             latency_ms = 1000 * (datetime.now() - captured_at).total_seconds()
             screen.append(
                 f"Block {tracker.blocks_analyzed}: {processing_ms[-1]:.0f} ms "
-                f"[{timer.compact(STREAM_STAGES)}] "
+                f"[{timer.compact(stages)}] "
                 f"(avg {np.mean(processing_ms):.0f}, max {max(processing_ms):.0f}; "
                 f"budget {BLOCK_SECONDS * 1000:.0f})  |  capture {capture_ms:.0f} ms  |  "
                 f"latency {latency_ms / 1000:.2f}s  |  "
@@ -635,7 +686,7 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
             sys.stdout.write("".join(screen))
             sys.stdout.flush()
 
-            block_timings.append({**{key: timer.ms[key] for key in ["capture"] + STREAM_STAGES},
+            block_timings.append({**{key: timer.ms[key] for key in ["capture"] + stages},
                                   "processing": processing_ms[-1], "latency": latency_ms})
     except KeyboardInterrupt:
         print("\n[*] Stopped by user (Ctrl+C).")
@@ -669,6 +720,18 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
             print(f"\n[OK] Stream summary saved:")
             print(f"     {json_name}")
             print(f"     {txt_name}")
+        if worker:
+            worker.stop()
+            print(f"\n[OK] Snapshots saved ({len(worker.saved) // 4} pairs, {worker.skipped} skipped "
+                  f"while the previous one was still drawing):")
+            for path in worker.saved:
+                print(f"     {os.path.normpath(path)}")
+        if session and session.blocks:
+            from spectrum_plots import save_session_plots
+            paths = save_session_plots(session.snapshot(track_detections(tracker), gain, ended))
+            print("\n[OK] Session plots saved (max-hold spectrum + last ~10 s waterfall):")
+            for path in paths:
+                print(f"     {os.path.normpath(path)}")
 
 
 def main():
@@ -679,7 +742,10 @@ def main():
     print("RTL-SDR DRONE RF THREAT SCANNER - LIVE")
     print("=" * 60)
 
-    components = load_components()
+    if args.plot:
+        import matplotlib
+        matplotlib.use("Agg")   # save only, never open a window
+    components = load_components(args.model)
     if components is None:
         return 1
     clf, fingerprinter, _ = components
@@ -710,7 +776,7 @@ def main():
             per_packet = USB_PACKET // 2
             block_samples = -(-int(BLOCK_SECONDS * sample_rate) // per_packet) * per_packet
             reader = BlockReader(sdr, block_samples, int(SETTLE_SECONDS * sample_rate))
-            run_stream(sdr, reader, center_freq, clf, fingerprinter)
+            run_stream(sdr, reader, center_freq, clf, fingerprinter, args.plot, args.plot_every)
             return status
 
         scan = 0

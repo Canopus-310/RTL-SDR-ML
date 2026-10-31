@@ -1,7 +1,13 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 import sys
+from datetime import datetime
 from scipy.io import wavfile
+
+from plot_style import apply_style, save_figure
+
+apply_style()
 
 if len(sys.argv) < 2:
     print("Usage: python capture_spectrum.py <recording.wav> [center_freq_hz]")
@@ -26,4 +32,8 @@ plt.ylabel("Relative power (dB)")
 plt.title(f"Spectrum around {center_freq/1e6} MHz")
 plt.grid(True)
 plt.tight_layout()
+# Also save the figure (300 dpi PNG + PDF) before showing the window
+stem = os.path.join("results", "spectra", f"{datetime.now():%Y%m%d_%H%M%S}_{int(round(center_freq))}Hz_spectrum")
+for path in save_figure(plt.gcf(), stem):
+    print(f"Saved {os.path.normpath(path)}")
 plt.show()

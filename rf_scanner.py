@@ -257,8 +257,60 @@ def _target_signal(target, center_freq, freqs_hz, psd_db, props, noise_floor):
     return info
 
 
+def detect_regions(iq, sample_rate, center_freq, timer=None):
+    """
+    Run both detectors and plan one target per signal (no classification).
+
+    Welch average (detect_signals) for steady signals, then the short-time burst
+    detector, FHSS grouping and plan_targets. Returns a dict with the Welch
+    products (freqs, freqs_hz, freqs_mhz, psd_db, noise_floor, threshold, peaks,
+    props), the burst products (spectrum, bursts, channels, emitters) and the
+    targets. analyze_iq and the model comparison's end-to-end test both use it.
+    """
+    if timer is None:
+        timer = StageTimer()
+    with timer.stage("detection"):
+        (freqs, freqs_hz, freqs_mhz, psd_db,
+         noise_floor, threshold, peaks, props) = detect_signals(iq, sample_rate, center_freq)
+    with timer.stage("bursts"):
+        spectrum = short_time_spectrum(iq, sample_rate)
+        bursts = refine_burst_timing(detect_bursts(spectrum), iq, sample_rate, spectrum)
+        channels = group_channels(bursts, spectrum)
+        emitters = find_fhss_emitters(channels)
+        targets = plan_targets(freqs, psd_db, peaks, channels, emitters, spectrum)
+    return {"freqs": freqs, "freqs_hz": freqs_hz, "freqs_mhz": freqs_mhz, "psd_db": psd_db,
+            "noise_floor": noise_floor, "threshold": threshold, "peaks": peaks, "props": props,
+            "spectrum": spectrum, "bursts": bursts, "channels": channels, "emitters": emitters,
+            "targets": targets}
+
+
+def target_features(iq, sample_rate, center_freq, target, regions, timer=None):
+    """
+    Describe one target and compute its 11 ML features.
+
+    Returns (info, sig_iq, iq_window, lora, features): describe_target's info,
+    the band-passed IQ and its time window, the dechirp result on the raw IQ
+    slice, and the feature vector (10 spectral/amplitude features + dechirp score).
+    """
+    if timer is None:
+        timer = StageTimer()
+    # Bandwidth + signal extraction (IQ from the burst's own time slice if it has one)
+    with timer.stage("extraction"):
+        info = describe_target(target, center_freq, regions["freqs_hz"], regions["psd_db"],
+                               regions["props"], regions["noise_floor"], len(iq) / sample_rate)
+        sig_iq, iq_window = extract_signal_iq(iq, sample_rate, info["iq_center_hz"],
+                                              info["iq_bw_hz"], info["window_s"])
+    # Features: the 10 spectral/amplitude features plus the dechirp score,
+    # computed on this target's own raw IQ slice around its center
+    with timer.stage("features"):
+        raw = iq[int(iq_window[0] * sample_rate):int(iq_window[1] * sample_rate)]
+        lora = dechirp_score(raw, sample_rate, info["iq_center_hz"])
+        features = extract_ml_features(sig_iq, sample_rate) + [lora["score_db"]]
+    return info, sig_iq, iq_window, lora, features
+
+
 def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
-               verbose=True, timer=None):
+               verbose=True, timer=None, details=None):
     """
     Detect, classify, fingerprint and threat-assess every signal in an IQ capture.
 
@@ -275,7 +327,8 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
     IQ slice; both feed fingerprint matching and the threat score.
 
     verbose=False suppresses the console output. timer, if given, is a
-    StageTimer that receives the time spent in each stage.
+    StageTimer that receives the time spent in each stage. details, if given,
+    is a dict that receives detect_regions' products (for plotting).
     """
     log = print if verbose else (lambda *args, **kwargs: None)
     if timer is None:
@@ -283,21 +336,18 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
 
     # --- Detect signals ---
     log(f"\n[*] Scanning spectrum around {center_freq/1e6:.3f} MHz...")
-    with timer.stage("detection"):
-        (freqs, freqs_hz, freqs_mhz, psd_db,
-         noise_floor, threshold, peaks, props) = detect_signals(iq, sample_rate, center_freq)
+    regions = detect_regions(iq, sample_rate, center_freq, timer)
+    if details is not None:
+        details.update(regions)
+    noise_floor, threshold, peaks = regions["noise_floor"], regions["threshold"], regions["peaks"]
+    spectrum, bursts, channels = regions["spectrum"], regions["bursts"], regions["channels"]
+    emitters, targets = regions["emitters"], regions["targets"]
 
     log(f"    Noise floor: {noise_floor:.1f} dB")
     log(f"    Threshold:   {threshold:.1f} dB")
     log(f"    Signals detected (Welch average): {len(peaks)}")
 
-    # --- Short-time burst detection, FHSS grouping, merge with Welch ---
-    with timer.stage("bursts"):
-        spectrum = short_time_spectrum(iq, sample_rate)
-        bursts = refine_burst_timing(detect_bursts(spectrum), iq, sample_rate, spectrum)
-        channels = group_channels(bursts, spectrum)
-        emitters = find_fhss_emitters(channels)
-        targets = plan_targets(freqs, psd_db, peaks, channels, emitters, spectrum)
+    # --- Short-time burst detection, FHSS grouping, merge with Welch (in detect_regions) ---
     timer.signals += len(targets)
 
     n_intermittent = sum(1 for ch in channels if not ch["continuous"] and ch["stable"])
@@ -318,12 +368,8 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
         log(f"\n[*] Analyzing {len(targets)} detected signal(s)...\n")
 
     for i, target in enumerate(targets):
-        # Bandwidth + signal extraction (IQ from the burst's own time slice if it has one)
-        with timer.stage("extraction"):
-            info = describe_target(target, center_freq, freqs_hz, psd_db, props, noise_floor,
-                                   len(iq) / sample_rate)
-            sig_iq, iq_window = extract_signal_iq(iq, sample_rate, info["iq_center_hz"],
-                                                  info["iq_bw_hz"], info["window_s"])
+        info, sig_iq, iq_window, lora, features = target_features(
+            iq, sample_rate, center_freq, target, regions, timer)
         freq_mhz = info["freq_mhz"]
         power = info["power_db"]
         prominence = info["prominence_db"]
@@ -333,13 +379,7 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
         duty = info["duty_cycle"]
         is_bursty = info["is_bursty"]
 
-        # Features: the 10 spectral/amplitude features plus the dechirp score,
-        # computed on this target's own raw IQ slice around its center
-        with timer.stage("features"):
-            raw = iq[int(iq_window[0] * sample_rate):int(iq_window[1] * sample_rate)]
-            lora = dechirp_score(raw, sample_rate, info["iq_center_hz"])
-            is_lora = lora["score_db"] >= LORA_THRESHOLD_DB
-            features = extract_ml_features(sig_iq, sample_rate) + [lora["score_db"]]
+        is_lora = lora["score_db"] >= LORA_THRESHOLD_DB
         with timer.stage("ml"):
             ml_class = clf.predict([features])[0]
             ml_proba = clf.predict_proba([features])[0]
@@ -426,17 +466,33 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
     return detections, noise_floor
 
 
-def load_components():
-    """Load the ML model, fingerprint DB and threat engine. Returns None if the model is missing."""
+def load_components(model="rf"):
+    """
+    Load the ML model, fingerprint DB and threat engine. Returns None if the model is missing.
+
+    model "rf" is the default deployed Random Forest (rf_classifier_model.joblib);
+    "xgb", "lgbm", "cat" and "ensemble" load models/<name>.joblib written by
+    compare_models.py. Every model returns class names, so nothing else changes.
+    """
     print("\n[*] Loading components...")
-    try:
-        clf = joblib.load("rf_classifier_model.joblib")
-        with open("rf_classifier_config.json") as f:
-            config = json.load(f)
-        print(f"    ML model loaded ({config['accuracy']:.0%} accuracy)")
-    except FileNotFoundError:
-        print("    [!] ML model not found — run train_rf_classifier.py first")
-        return None
+    if model == "rf":
+        try:
+            clf = joblib.load("rf_classifier_model.joblib")
+            with open("rf_classifier_config.json") as f:
+                config = json.load(f)
+            print(f"    ML model loaded ({config['accuracy']:.0%} accuracy)")
+        except FileNotFoundError:
+            print("    [!] ML model not found — run train_rf_classifier.py first")
+            return None
+    else:
+        from models import load_model
+        try:
+            clf, meta = load_model(model)
+        except FileNotFoundError:
+            print(f"    [!] Model models/{model}.joblib not found — run compare_models.py first")
+            return None
+        print(f"    ML model loaded ({model}: CV macro-F1 {meta['cv_macro_f1_mean']:.3f} "
+              f"+- {meta['cv_macro_f1_std']:.3f})")
 
     fingerprinter = DroneFingerprinter()
     print(f"    Fingerprint DB loaded ({len(fingerprinter.detectable)} drone profiles)")

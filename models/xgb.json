@@ -1,0 +1,39 @@
+{
+  "name": "xgb",
+  "classes": [
+    "DRONE_TELEMETRY",
+    "DRONE_VIDEO",
+    "FM_BROADCAST",
+    "INTERFERENCE",
+    "LORA",
+    "NOISE"
+  ],
+  "features": [
+    "bandwidth_hz",
+    "peak_power_db",
+    "snr_db",
+    "spectral_flatness",
+    "amp_variation",
+    "amp_kurtosis",
+    "freq_std_hz",
+    "freq_range_hz",
+    "duty_cycle",
+    "num_spectral_peaks",
+    "dechirp_score_db"
+  ],
+  "params": {
+    "colsample_bytree": 0.9122116705145822,
+    "learning_rate": 0.027550628717863315,
+    "max_depth": 3,
+    "min_child_weight": 2,
+    "n_estimators": 365,
+    "reg_lambda": 1.187808582376631,
+    "subsample": 0.9034462497289428
+  },
+  "cv_macro_f1_mean": 0.988293593697307,
+  "cv_macro_f1_std": 0.006178800481049843,
+  "seed": 0,
+  "snr_definition": "In-band SNR = P_signal / (N0 x B): signal power while transmitting divided by the noise power inside the signal's occupied bandwidth B (noise is white over the full 2.4 MHz capture).",
+  "created": "2026-11-01T00:32:49.878975",
+  "quick": false
+}
