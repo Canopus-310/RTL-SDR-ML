@@ -31,7 +31,9 @@ from scipy.io import wavfile
 
 from rf_scanner import analyze_iq, load_components, report_scan
 from stage_timer import StageTimer, STAGES, stage_stats
-from threat_engine import ThreatEngine, SEVERITY_LEVELS
+from burst_detector import CONTINUOUS_DUTY
+from threat_engine import (ThreatEngine, SEVERITY_LEVELS, VERDICTS, decide_verdict,
+                           severity_for_score)
 
 SAMPLE_RATE = 2400000     # rate the ML model was trained at and SDR++ recorded at
 SETTLE_SECONDS = 0.2      # discarded after tuning: PLL settling + stale USB buffer data
@@ -42,11 +44,10 @@ USB_PACKET = 512          # librtlsdr sync reads must be a multiple of this
 BLOCK_SECONDS = 0.5       # IQ per analyzed block
 QUEUE_BLOCKS = 2          # blocks buffered before the oldest is dropped
 TRACK_TOLERANCE_KHZ = 20  # a detection joins the nearest track within this distance
-BURST_MIN_BLOCKS = 4      # blocks a track must span before its burstiness is judged
-BURST_PRESENCE = 0.8      # present in fewer than this fraction of blocks -> bursty
+FHSS_CHANNEL_TOLERANCE_KHZ = 50  # a frequency within this of a hop channel belongs to that emitter
 TABLE_ROWS = 20           # live table shows the top tracks by max threat
 # Per-block stages in stream mode (no per-block report), and their summary labels
-STREAM_STAGES = ["detection", "extraction", "features", "ml", "fingerprint", "threat"]
+STREAM_STAGES = ["detection", "bursts", "extraction", "features", "ml", "fingerprint", "threat"]
 STREAM_STAT_LABELS = {**{key: label for key, label, _ in STAGES},
                       "capture": "Capture (block read)",
                       "processing": "Processing (analyze_iq)",
@@ -254,9 +255,16 @@ class SignalTracker:
     """
     Groups detections from successive stream blocks into per-signal tracks.
 
-    Burstiness is measured from how often a track appears across analyzed
-    blocks, so it only sees on/off patterns slower than BLOCK_SECONDS — a
-    signal that bursts at least once per block looks continuous.
+    Burstiness comes from the duty cycle the burst detector measured inside
+    each block (on/off times of the signal's bursts): a track's duty cycle is
+    the median over the blocks it was seen in, bursty below CONTINUOUS_DUTY.
+    Presence (blocks seen / blocks spanned) is shown separately and does not
+    affect burstiness.
+
+    A frequency-hopping emitter is one track: FHSS detections join the FHSS
+    track that shares a channel with them, single-channel detections on one of
+    its known channels count towards it, and plain tracks created on its
+    channels before it was recognised are absorbed into it.
     """
 
     def __init__(self):
@@ -264,69 +272,200 @@ class SignalTracker:
         self.blocks_analyzed = 0
 
     def find(self, freq_mhz):
-        """Nearest track within TRACK_TOLERANCE_KHZ of freq_mhz, or None."""
-        nearest = min(self.tracks, key=lambda t: abs(t["freq_mhz"] - freq_mhz), default=None)
+        """Nearest plain (non-FHSS) track within TRACK_TOLERANCE_KHZ of freq_mhz, or None."""
+        plain = [t for t in self.tracks if t["fhss"] is None]
+        nearest = min(plain, key=lambda t: abs(t["freq_mhz"] - freq_mhz), default=None)
         if nearest is not None and abs(nearest["freq_mhz"] - freq_mhz) * 1000 <= TRACK_TOLERANCE_KHZ:
             return nearest
+        return None
+
+    @staticmethod
+    def _on_channel(freq_mhz, channels_mhz):
+        return any(abs(freq_mhz - c) * 1000 <= FHSS_CHANNEL_TOLERANCE_KHZ for c in channels_mhz)
+
+    def find_fhss(self, channels_mhz):
+        """FHSS track sharing at least one channel with channels_mhz, or None."""
+        for t in self.tracks:
+            if t["fhss"] is not None and any(self._on_channel(c, t["fhss"]["channels_mhz"])
+                                             for c in channels_mhz):
+                return t
         return None
 
     def blocks_spanned(self, track):
         return self.blocks_analyzed - track["first_block"] + 1
 
+    def hits(self, track):
+        return len(track["blocks"])
+
     def presence(self, track):
-        return track["hits"] / self.blocks_spanned(track)
+        return self.hits(track) / self.blocks_spanned(track)
+
+    def duty(self, track):
+        """Median measured duty cycle over the blocks the track was seen in, or None."""
+        return float(np.median(track["duties"])) if track["duties"] else None
 
     def bursty(self, track):
-        """True/False from presence across blocks, or None until the track spans enough blocks."""
-        if track is None or self.blocks_spanned(track) < BURST_MIN_BLOCKS:
-            return None
-        return self.presence(track) < BURST_PRESENCE
+        """True/False from the measured duty cycle, or None if it was never measured."""
+        duty = self.duty(track)
+        return None if duty is None else duty < CONTINUOUS_DUTY
 
-    def is_bursty(self, freq_mhz):
-        """burst_lookup for analyze_iq: measured burstiness, False while still unknown."""
-        return bool(self.bursty(self.find(freq_mhz)))
+    def _new_track(self, freq_mhz, seen_at, block):
+        track = {"freq_mhz": freq_mhz, "first_seen": seen_at, "last_seen": seen_at,
+                 "first_block": block, "blocks": set(), "max_threat": -1, "best": None,
+                 "fhss": None, "duties": [], "lora_hits": 0,
+                 "bursts_seen": 0, "lora": None, "dechirp_max": None, "ml_classes": {}}
+        self.tracks.append(track)
+        return track
+
+    def _fhss_track_for(self, d, seen_at, block):
+        """The FHSS track for an FHSS detection: existing, or new with plain tracks on its channels absorbed."""
+        info = d["fhss"]
+        track = self.find_fhss(info["channels_mhz"])
+        if track is None:
+            track = self._new_track(d["freq_mhz"], seen_at, block)
+            track["fhss"] = {"channels_mhz": [], "hops": 0, "hop_rates_hz": [], "dwells_ms": []}
+        fh = track["fhss"]
+        for c in info["channels_mhz"]:
+            if not self._on_channel(c, fh["channels_mhz"]):
+                fh["channels_mhz"].append(c)
+        fh["channels_mhz"].sort()
+        fh["hops"] += info["hops"]
+        fh["hop_rates_hz"].append(info["hop_rate_hz"])
+        fh["dwells_ms"].append(info["dwell_ms"])
+        track["freq_mhz"] = float(np.mean(fh["channels_mhz"]))
+        for t in [t for t in self.tracks if t["fhss"] is None
+                  and self._on_channel(t["freq_mhz"], fh["channels_mhz"])]:
+            self._absorb(track, t)
+        return track
+
+    def _absorb(self, track, other):
+        """Merge a plain track into an FHSS track and drop it."""
+        track["blocks"] |= other["blocks"]
+        track["lora_hits"] += other["lora_hits"]
+        track["bursts_seen"] += other["bursts_seen"]
+        track["lora"] = track["lora"] or other["lora"]
+        if other["dechirp_max"] is not None:
+            track["dechirp_max"] = (other["dechirp_max"] if track["dechirp_max"] is None
+                                    else max(track["dechirp_max"], other["dechirp_max"]))
+        for cls, n in other["ml_classes"].items():
+            track["ml_classes"][cls] = track["ml_classes"].get(cls, 0) + n
+        track["first_seen"] = min(track["first_seen"], other["first_seen"])
+        track["first_block"] = min(track["first_block"], other["first_block"])
+        track["last_seen"] = max(track["last_seen"], other["last_seen"])
+        if other["max_threat"] > track["max_threat"]:
+            track["max_threat"], track["best"] = other["max_threat"], other["best"]
+        self.tracks.remove(other)
 
     def update(self, detections, seen_at):
         """Fold one analyzed block's detections into the tracks."""
         self.blocks_analyzed += 1
         block = self.blocks_analyzed
         for d in detections:
-            track = self.find(d["freq_mhz"])
-            if track is None:
-                track = {"freq_mhz": d["freq_mhz"], "first_seen": seen_at, "last_seen": seen_at,
-                         "first_block": block, "last_block": 0, "hits": 0,
-                         "max_threat": -1, "best": None}
-                self.tracks.append(track)
-            if track["last_block"] != block:  # count each track at most once per block
-                track["hits"] += 1
-                track["freq_mhz"] += (d["freq_mhz"] - track["freq_mhz"]) / track["hits"]
-                track["last_block"] = block
-                track["last_seen"] = seen_at
+            if d.get("fhss"):
+                track = self._fhss_track_for(d, seen_at, block)
+            else:
+                track = next((t for t in self.tracks if t["fhss"] is not None and
+                              self._on_channel(d["freq_mhz"], t["fhss"]["channels_mhz"])), None)
+                track = track or self.find(d["freq_mhz"])
+                if track is None:
+                    track = self._new_track(d["freq_mhz"], seen_at, block)
+                if track["fhss"] is None and block not in track["blocks"]:
+                    n = len(track["blocks"]) + 1
+                    track["freq_mhz"] += (d["freq_mhz"] - track["freq_mhz"]) / n
+            if block not in track["blocks"] or d.get("fhss"):
+                # One duty measurement per track per block; an FHSS detection's
+                # duty (all hops in the block) supersedes single-channel ones
+                if d.get("duty_cycle") is not None:
+                    if block in track["blocks"] and track["duties"]:
+                        track["duties"][-1] = d["duty_cycle"]
+                    else:
+                        track["duties"].append(d["duty_cycle"])
+            track["lora_hits"] += bool(d.get("lora_rule"))
+            track["bursts_seen"] += d.get("bursts", 0)
+            track["ml_classes"][d["ml_class"]] = track["ml_classes"].get(d["ml_class"], 0) + 1
+            if d.get("dechirp_score_db") is not None:
+                track["dechirp_max"] = max(track["dechirp_max"] if track["dechirp_max"] is not None
+                                           else d["dechirp_score_db"], d["dechirp_score_db"])
+            if d.get("lora_rule") and (track["lora"] is None
+                                       or d["dechirp_score_db"] > track["lora"]["score_db"]):
+                track["lora"] = {"score_db": d["dechirp_score_db"], "sf": d["lora_sf"],
+                                 "bw_khz": d["lora_bw_khz"]}
+            track["blocks"].add(block)  # a track counts at most once per block
+            track["last_seen"] = seen_at
             if d["threat_score"] > track["max_threat"]:
                 track["max_threat"] = d["threat_score"]
                 track["best"] = d
 
+    def packet_rate(self, track):
+        """Bursts seen per second of analyzed time the track spans."""
+        return track["bursts_seen"] / (self.blocks_spanned(track) * BLOCK_SECONDS)
+
+    def verdict(self, track):
+        """
+        (verdict, reasons) for the track, from evidence accumulated over all its
+        blocks: LoRa hits, most common ML label, FHSS hop rate, median duty cycle
+        and packet rate. A single block can miss hops (or the whole emitter);
+        the track sees the full picture.
+        """
+        best = track["best"]
+        ml_class = max(track["ml_classes"], key=track["ml_classes"].get, default=best["ml_class"])
+        fhss = None
+        if track["fhss"]:
+            stats = fhss_stats(track["fhss"])
+            fhss = {"channels_mhz": stats["channels_mhz"], "hop_rate_hz": stats["hop_rate_hz"]}
+        return decide_verdict({
+            "freq_mhz": track["freq_mhz"], "bandwidth_khz": best["bandwidth_khz"],
+            "ml_class": ml_class, "lora": track["lora"], "dechirp_score_db": track["dechirp_max"],
+            "fhss": fhss, "is_bursty": self.bursty(track), "duty_cycle": self.duty(track),
+            "packet_rate_hz": self.packet_rate(track) if track["bursts_seen"] else None,
+            "fingerprint_id": best.get("fingerprint_id"),
+        })
+
+    def threat(self, track):
+        """Highest threat score seen, bounded by the track's verdict."""
+        bounds = VERDICTS[self.verdict(track)[0]]
+        return min(max(track["max_threat"], bounds["min_score"]), bounds["max_score"])
+
     def ranked(self):
-        return sorted(self.tracks, key=lambda t: (-t["max_threat"], t["freq_mhz"]))
+        return sorted(self.tracks, key=lambda t: (-self.threat(t), t["freq_mhz"]))
+
+
+def fhss_stats(fh):
+    """Channels seen, total hops, mean hop rate and median dwell of an FHSS track."""
+    return {"channels_mhz": fh["channels_mhz"], "hops": fh["hops"],
+            "hop_rate_hz": round(float(np.mean(fh["hop_rates_hz"])), 2),
+            "dwell_ms": round(float(np.median(fh["dwells_ms"])), 1)}
+
+
+def fhss_summary(fh):
+    s = fhss_stats(fh)
+    return (f"{len(s['channels_mhz'])} channels ({', '.join(f'{c:.3f}' for c in s['channels_mhz'])} MHz)  "
+            f"|  {s['hop_rate_hz']:.1f} hops/s  |  dwell {s['dwell_ms']:.1f} ms  |  {s['hops']} hops seen")
 
 
 def format_track_table(tracker, max_rows=None):
     """Render the tracks as a fixed-width table, highest max threat first."""
     lines = [f"  {'Freq MHz':>10}  {'First':>8}  {'Last':>8}  {'Hits/Blk':>9}  {'Present':>7}  "
-             f"{'Bursty':>6}  {'Max threat':<15}  Fingerprint",
-             "  " + "-" * 98]
+             f"{'Duty':>8}  {'LoRa':>4}  {'Verdict':<28}  {'Threat':<15}  Fingerprint",
+             "  " + "-" * 138]
     rows = tracker.ranked()
     for t in rows[:max_rows]:
-        bursty = {None: "?", True: "yes", False: "no"}[tracker.bursty(t)]
-        hits = f"{t['hits']}/{tracker.blocks_spanned(t)}"
-        threat = f"{t['max_threat']}/100 {t['best']['threat_severity']}"
+        duty = tracker.duty(t)
+        duty_text = "?" if duty is None else f"{duty:.0%} {'B' if tracker.bursty(t) else 'C'}"
+        hits = f"{tracker.hits(t)}/{tracker.blocks_spanned(t)}"
+        score = tracker.threat(t)
+        threat = f"{score}/100 {severity_for_score(score)}"
         lines.append(f"  {t['freq_mhz']:10.3f}  {t['first_seen']:%H:%M:%S}  {t['last_seen']:%H:%M:%S}  "
-                     f"{hits:>9}  {tracker.presence(t):>7.0%}  {bursty:>6}  {threat:<15}  "
+                     f"{hits:>9}  {tracker.presence(t):>7.0%}  {duty_text:>8}  "
+                     f"{'yes' if t['lora_hits'] else 'no':>4}  {tracker.verdict(t)[0]:<28}  {threat:<15}  "
                      f"{t['best']['fingerprint_name'] or '-'}")
+        if t["fhss"]:
+            lines.append(f"  {'':10}  FHSS emitter: {fhss_summary(t['fhss'])}")
     if not rows:
         lines.append("  (no signals yet)")
     elif max_rows is not None and len(rows) > max_rows:
         lines.append(f"  ... {len(rows) - max_rows} more")
+    lines.append("  Duty: median measured on-time per block (B = bursty, C = continuous)")
     return "\n".join(lines)
 
 
@@ -350,25 +489,36 @@ def enable_ansi():
 def save_stream_summary(tracker, stream, metadata):
     """Write the stream summary as JSON + text reports. Returns the filenames."""
     ranked = tracker.ranked()
-    max_threat = max((t["max_threat"] for t in ranked), default=0)
-    max_severity = next(level for level, info in SEVERITY_LEVELS.items()
-                        if max_threat >= info["min_score"])
+    verdicts = {id(t): tracker.verdict(t) for t in ranked}
+    max_threat = max((tracker.threat(t) for t in ranked), default=0)
+    max_severity = severity_for_score(max_threat)
+    verdict_counts = {}
+    for verdict, _ in verdicts.values():
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
     summary = {
         "overall_assessment": f"{max_severity} - {SEVERITY_LEVELS[max_severity]['action']}",
         "max_threat_score": max_threat,
         "tracks": len(ranked),
         "drone_candidates": sum(1 for t in ranked if t["max_threat"] >= 40),
+        "fhss_emitters": sum(1 for t in ranked if t["fhss"]),
+        "verdict_counts": verdict_counts,
     }
     tracks = [{
+        "verdict": verdicts[id(t)][0],
+        "verdict_reasons": verdicts[id(t)][1],
         "freq_mhz": round(t["freq_mhz"], 3),
         "first_seen": t["first_seen"].isoformat(),
         "last_seen": t["last_seen"].isoformat(),
-        "hits": t["hits"],
+        "hits": tracker.hits(t),
         "blocks_spanned": tracker.blocks_spanned(t),
         "presence": round(tracker.presence(t), 3),
+        "duty_cycle": None if tracker.duty(t) is None else round(tracker.duty(t), 3),
         "bursty": tracker.bursty(t),
-        "max_threat_score": t["max_threat"],
-        "max_threat_severity": t["best"]["threat_severity"],
+        "lora_blocks": t["lora_hits"],
+        "packet_rate_hz": round(tracker.packet_rate(t), 3),
+        "fhss": fhss_stats(t["fhss"]) if t["fhss"] else None,
+        "threat_score": tracker.threat(t),
+        "threat_severity": severity_for_score(tracker.threat(t)),
         "max_threat_detection": t["best"],
     } for t in ranked]
 
@@ -404,17 +554,27 @@ def save_stream_summary(tracker, stream, metadata):
         f.write(f"Overall:           {summary['overall_assessment']}\n")
         f.write(f"Max Threat Score:  {summary['max_threat_score']}/100\n")
         f.write(f"Tracks:            {summary['tracks']}\n")
-        f.write(f"Drone Candidates:  {summary['drone_candidates']}\n\n")
+        f.write(f"Drone Candidates:  {summary['drone_candidates']}\n")
+        f.write(f"FHSS Emitters:     {summary['fhss_emitters']}\n")
+        f.write("Verdicts:          " + (", ".join(f"{k}: {v}" for k, v in verdict_counts.items())
+                                         or "none") + "\n\n")
         f.write("SIGNAL TRACKS\n")
         f.write(format_track_table(tracker) + "\n\n")
-        f.write("HIGHEST-THREAT DETECTION PER TRACK\n")
+        f.write("TRACKS: VERDICT, THEN HIGHEST-THREAT DETECTION\n")
         f.write("-" * 60 + "\n")
         for t in ranked:
             d = t["best"]
-            f.write(f"\n  {t['freq_mhz']:.3f} MHz: {d['threat_score']}/100 ({d['threat_severity']})\n")
+            verdict, reasons = verdicts[id(t)]
+            score = tracker.threat(t)
+            f.write(f"\n  {t['freq_mhz']:.3f} MHz  —  VERDICT: {verdict}  "
+                    f"({score}/100 {severity_for_score(score)})\n")
+            for reason in reasons:
+                f.write(f"    - {reason}\n")
             f.write(f"  Power {d['power_db']:.1f} dB, bandwidth {d['bandwidth_khz']:.1f} kHz, "
                     f"ML {d['ml_class']} ({d['ml_confidence']:.0%}), "
                     f"fingerprint {d['fingerprint_name'] or 'no match'}\n")
+            if t["fhss"]:
+                f.write(f"  FHSS emitter: {fhss_summary(t['fhss'])}\n")
             for fac in d["threat_factors"]:
                 f.write(f"    [{fac['points']:+3d}] {fac['factor']}: {fac['detail']}\n")
         f.write("\n" + "=" * 60 + "\nEND OF REPORT\n" + "=" * 60 + "\n")
@@ -451,7 +611,7 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
             timer.add("capture", capture_ms)
             detections, noise_floor = analyze_iq(
                 iq, sample_rate, center_freq, clf, fingerprinter, ThreatEngine(),
-                verbose=False, burst_lookup=tracker.is_bursty, timer=timer)
+                verbose=False, timer=timer)
             processing_ms.append(timer.elapsed_ms())
             tracker.update(detections, captured_at)
 
@@ -546,8 +706,10 @@ def main():
 
         if args.stream:
             sample_rate = int(sdr.sample_rate)
-            reader = BlockReader(sdr, int(BLOCK_SECONDS * sample_rate),
-                                 int(SETTLE_SECONDS * sample_rate))
+            # Whole USB packets per block, so read_iq never discards bytes between blocks
+            per_packet = USB_PACKET // 2
+            block_samples = -(-int(BLOCK_SECONDS * sample_rate) // per_packet) * per_packet
+            reader = BlockReader(sdr, block_samples, int(SETTLE_SECONDS * sample_rate))
             run_stream(sdr, reader, center_freq, clf, fingerprinter)
             return status
 

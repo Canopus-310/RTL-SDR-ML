@@ -18,7 +18,7 @@ DRONE_BANDS = [
 ]
 
 # ML classes that indicate drone activity
-DRONE_ML_CLASSES = ["DRONE_TELEMETRY", "DRONE_VIDEO"]
+DRONE_ML_CLASSES = ["DRONE_TELEMETRY", "DRONE_VIDEO", "LORA"]
 SUSPECT_ML_CLASSES = ["NARROWBAND_SIGNAL", "INTERFERENCE"]
 
 SEVERITY_LEVELS = {
@@ -33,6 +33,131 @@ SEVERITY_LEVELS = {
     "NONE":     {"min_score": 0,  "color": "GREEN",
                  "action": "No drone threat indicators. Signal appears to be non-drone RF activity."},
 }
+
+# Final verdict per emitter/track, separate from the ML label. Each verdict
+# bounds the threat score, so only a drone control link reaches HIGH/CRITICAL
+# and LoRaWAN-like IoT traffic stays LOW.
+VERDICTS = {
+    "DRONE_CONTROL_TELEMETRY_LINK": {
+        "min_score": 60, "max_score": 100,
+        "meaning": "LoRa link hopping fast across a drone band, like ELRS / Crossfire / FrSky R9"},
+    "FSK_TELEMETRY": {
+        "min_score": 0, "max_score": 59,
+        "meaning": "SiK-like FSK telemetry radio (MAVLink)"},
+    "POSSIBLE_IOT_LORA": {
+        "min_score": 0, "max_score": 35,
+        "meaning": "LoRa without fast hopping, LoRaWAN-like (smart meters and sensors use "
+                   "865-867 MHz in India)"},
+    "NOT_DRONE": {
+        "min_score": 0, "max_score": 19,
+        "meaning": "FM, noise, interference or another non-drone signal"},
+}
+DRONE_LINK_MIN_HOP_RATE_HZ = 8.0   # "~10 hops/s or more"; RC links hop tens to hundreds of times a second
+IOT_MAX_PACKET_RATE_HZ = 1.0       # LoRaWAN devices send a packet every few seconds or less often
+FSK_MAX_BANDWIDTH_KHZ = 60         # SiK radios occupy ~10-40 kHz
+INDIA_LORAWAN_BAND_MHZ = (865.0, 867.0)
+
+
+def drone_band_at(freq_mhz):
+    """The DRONE_BANDS entry containing freq_mhz, or None."""
+    return next((b for b in DRONE_BANDS if b["min"] <= freq_mhz <= b["max"]), None)
+
+
+def severity_for_score(score):
+    """Severity level name for a 0-100 threat score."""
+    return next(level for level, info in SEVERITY_LEVELS.items() if score >= info["min_score"])
+
+
+def decide_verdict(evidence):
+    """
+    Final verdict for one emitter or track, with the reasons behind it.
+
+    evidence keys (missing ones count as unknown/no):
+        freq_mhz, bandwidth_khz, ml_class
+        lora:            dict when the dechirp rule fired (score_db, sf, bw_khz), else None
+        dechirp_score_db the dechirp score even when the rule did not fire
+        fhss:            dict for a hopping emitter (channels_mhz, hop_rate_hz), else None
+        is_bursty, duty_cycle, packet_rate_hz (bursts per second)
+        fingerprint_id:  id of the best fingerprint match, e.g. "sik_433"
+
+    Rules, in order:
+      DRONE_CONTROL_TELEMETRY_LINK  LoRa (dechirp rule or ML label LORA) + FHSS +
+                                    hop rate >= DRONE_LINK_MIN_HOP_RATE_HZ + bursty +
+                                    inside a known drone band
+      POSSIBLE_IOT_LORA             LoRa that fails any of those (slow or no hopping,
+                                    low packet rate, 125 kHz: LoRaWAN-like)
+      FSK_TELEMETRY                 not LoRa, bursty, <= FSK_MAX_BANDWIDTH_KHZ and ML label
+                                    DRONE_TELEMETRY or a SiK fingerprint
+      NOT_DRONE                     everything else (FM, noise, interference)
+
+    Returns (verdict, reasons).
+    """
+    freq = evidence.get("freq_mhz", 0)
+    bw = evidence.get("bandwidth_khz") or 0
+    ml_class = evidence.get("ml_class")
+    lora = evidence.get("lora")
+    fhss = evidence.get("fhss")
+    bursty = bool(evidence.get("is_bursty"))
+    duty = evidence.get("duty_cycle")
+    packet_rate = evidence.get("packet_rate_hz")
+    band = drone_band_at(freq)
+    duty_text = "" if duty is None else f" ({duty:.0%} duty)"
+
+    lora_reasons = []
+    if lora:
+        lora_reasons.append(f"LoRa confirmed by dechirping ({lora['score_db']:.1f} dB, "
+                            f"SF{lora['sf']}, {lora['bw_khz']:.0f} kHz)")
+    if ml_class == "LORA":
+        lora_reasons.append("ML label LORA")
+
+    if lora_reasons:
+        hop_rate = fhss["hop_rate_hz"] if fhss else None
+        checks = [
+            (fhss is not None,
+             f"frequency hopping across {len(fhss['channels_mhz'])} channels" if fhss
+             else "no frequency hopping seen"),
+            (hop_rate is not None and hop_rate >= DRONE_LINK_MIN_HOP_RATE_HZ,
+             f"hop rate {hop_rate:.1f}/s "
+             + ("(fast, RC-link-like)" if hop_rate >= DRONE_LINK_MIN_HOP_RATE_HZ
+                else f"(slow, below {DRONE_LINK_MIN_HOP_RATE_HZ:.0f}/s)")
+             if hop_rate is not None else f"no hop rate (needs >= {DRONE_LINK_MIN_HOP_RATE_HZ:.0f}/s)"),
+            (bursty, f"bursty{duty_text}" if bursty else f"not bursty{duty_text}"),
+            (band is not None,
+             f"{freq:.3f} MHz is in the {band['name']} drone band" if band
+             else f"{freq:.3f} MHz is outside the known drone bands"),
+        ]
+        if all(ok for ok, _ in checks):
+            return "DRONE_CONTROL_TELEMETRY_LINK", lora_reasons + [text for _, text in checks]
+        reasons = lora_reasons + [text for ok, text in checks if not ok]
+        if packet_rate is not None:
+            reasons.append(f"{packet_rate:.2f} packets/s"
+                           + (" (low, LoRaWAN-like)" if packet_rate <= IOT_MAX_PACKET_RATE_HZ else ""))
+        lora_bw = lora["bw_khz"] if lora else bw
+        if lora_bw and abs(lora_bw - 125) <= 15:
+            reasons.append("125 kHz, the usual LoRaWAN bandwidth")
+        if INDIA_LORAWAN_BAND_MHZ[0] <= freq <= INDIA_LORAWAN_BAND_MHZ[1]:
+            reasons.append("865-867 MHz is used by LoRaWAN smart meters and sensors in India")
+        return "POSSIBLE_IOT_LORA", reasons
+
+    fp_id = evidence.get("fingerprint_id") or ""
+    fsk_like = ml_class == "DRONE_TELEMETRY" or fp_id.startswith("sik")
+    if fsk_like and bursty and 0 < bw <= FSK_MAX_BANDWIDTH_KHZ:
+        return "FSK_TELEMETRY", [
+            "ML label DRONE_TELEMETRY (FSK)" if ml_class == "DRONE_TELEMETRY"
+            else "matches a SiK telemetry fingerprint",
+            f"narrow ({bw:.0f} kHz, SiK-like)",
+            f"bursty{duty_text}",
+        ] + ([f"{freq:.3f} MHz is in the {band['name']} drone band"] if band else [])
+
+    score = evidence.get("dechirp_score_db")
+    reasons = [f"ML label {ml_class}" if ml_class else "no ML label",
+               "not LoRa" + ("" if score is None else f" (dechirp {score:.1f} dB)")]
+    if fsk_like:
+        reasons.append("FSK-like but " + ("not bursty" if not bursty else f"too wide ({bw:.0f} kHz)")
+                       + duty_text)
+    elif not bursty:
+        reasons.append(f"continuous{duty_text}" if duty is not None else "no burst pattern")
+    return "NOT_DRONE", reasons
 
 
 class ThreatEngine:
@@ -55,9 +180,18 @@ class ThreatEngine:
                 - fingerprint_match: tuple (profile, score, reasons) or None
                 - is_bursty: bool (optional)
                 - duty_cycle: float (optional)
+                - fhss: dict (optional) for a frequency-hopping emitter, with
+                  channels_mhz, hop_rate_hz and dwell_ms
+                - lora: dict (optional) when the dechirp rule fired, with
+                  score_db, sf and bw_khz
+                - dechirp_score_db, packet_rate_hz (optional) for the verdict
+
+        The factor score is then bounded by the verdict (decide_verdict), so the
+        verdict sets the threat level: only DRONE_CONTROL_TELEMETRY_LINK can reach
+        HIGH/CRITICAL.
 
         Returns:
-            dict with threat assessment results
+            dict with threat assessment results, including verdict and verdict_reasons
         """
         score = 0
         factors = []
@@ -212,13 +346,58 @@ class ThreatEngine:
                           "— high correlation"
             })
 
-        # --- Determine severity ---
+        # --- Factor 6: Frequency hopping (0-15 points) ---
+        fhss = detection.get("fhss")
+        if fhss:
+            score += 15
+            factors.append({
+                "factor": "FREQUENCY_HOPPING",
+                "points": 15,
+                "detail": f"Hops across {len(fhss['channels_mhz'])} channels "
+                          f"({fhss['hop_rate_hz']:.1f} hops/s, dwell {fhss['dwell_ms']:.0f} ms) "
+                          f"— frequency hopping is typical of drone RC links "
+                          f"(ExpressLRS, Crossfire, FrSky R9)"
+            })
+            recommendations.append(
+                "Frequency-hopping link: monitor all of its channels together, "
+                "not a single frequency")
+
+        # --- Factor 7: LoRa chirp modulation (0-10 points) ---
+        lora = detection.get("lora")
+        if lora:
+            score += 10
+            factors.append({
+                "factor": "LORA_MODULATION",
+                "points": 10,
+                "detail": f"Dechirping confirms LoRa chirp modulation (score {lora['score_db']:.1f} dB, "
+                          f"SF{lora['sf']}, {lora['bw_khz']:.0f} kHz) — used by long-range "
+                          f"drone RC links (ExpressLRS, Crossfire, FrSky R9)"
+            })
+
+        # --- Verdict: bounds the score so it sets the threat level ---
         score = min(score, 100)
-        severity = "NONE"
-        for level, info in SEVERITY_LEVELS.items():
-            if score >= info["min_score"]:
-                severity = level
-                break
+        verdict, verdict_reasons = decide_verdict({
+            "freq_mhz": freq, "bandwidth_khz": bw, "ml_class": ml_class,
+            "lora": lora, "dechirp_score_db": detection.get("dechirp_score_db"),
+            "fhss": fhss, "is_bursty": is_bursty, "duty_cycle": detection.get("duty_cycle"),
+            "packet_rate_hz": detection.get("packet_rate_hz"),
+            "fingerprint_id": fp_match[0]["id"] if fp_match else None,
+        })
+        bounds = VERDICTS[verdict]
+        bounded = min(max(score, bounds["min_score"]), bounds["max_score"])
+        if bounded != score:
+            factors.append({
+                "factor": "VERDICT",
+                "points": bounded - score,
+                "detail": f"Verdict {verdict} "
+                          + (f"caps the score at {bounds['max_score']}" if bounded < score
+                             else f"raises the score to at least {bounds['min_score']}")
+                          + f" — {bounds['meaning']}"
+            })
+            score = bounded
+
+        # --- Determine severity ---
+        severity = severity_for_score(score)
 
         # --- Generate recommendations ---
         if severity in ("CRITICAL", "HIGH"):
@@ -232,12 +411,17 @@ class ThreatEngine:
             recommendations.append("Check if authorized drone operations are scheduled")
         elif severity == "LOW":
             recommendations.append("No immediate action required — log for baseline")
+        if verdict == "POSSIBLE_IOT_LORA":
+            recommendations.append("Likely LoRaWAN IoT (smart meter / sensor): log it; re-assess "
+                                   "if it starts hopping fast or its packet rate rises")
 
         assessment = {
             "freq_mhz": freq,
             "bandwidth_khz": bw,
             "power_db": power,
             "ml_class": ml_class,
+            "verdict": verdict,
+            "verdict_reasons": verdict_reasons,
             "threat_score": score,
             "severity": severity,
             "severity_info": SEVERITY_LEVELS[severity],
@@ -254,6 +438,9 @@ class ThreatEngine:
         info = assessment["severity_info"]
 
         print(f"\n  {'='*56}")
+        print(f"  VERDICT: {assessment['verdict']}")
+        for r in assessment["verdict_reasons"]:
+            print(f"    - {r}")
         print(f"  THREAT SCORE: {assessment['threat_score']}/100  |  "
               f"Severity: {sev} ({info['color']})")
         print(f"  {'='*56}")
@@ -294,8 +481,12 @@ class ThreatEngine:
                 print(f"  {color:6s}: {count}")
 
         max_threat = max(self.assessments, key=lambda a: a["threat_score"])
+        verdicts = {}
+        for a in self.assessments:
+            verdicts[a["verdict"]] = verdicts.get(a["verdict"], 0) + 1
+        print("Verdicts: " + ", ".join(f"{v}: {n}" for v, n in verdicts.items()))
         print(f"\nHighest threat: {max_threat['threat_score']}/100 "
-              f"({max_threat['severity']}) at {max_threat['freq_mhz']:.1f} MHz")
+              f"({max_threat['severity']}, {max_threat['verdict']}) at {max_threat['freq_mhz']:.1f} MHz")
 
         if max_threat["severity"] in ("CRITICAL", "HIGH"):
             print(f"\n  ** ALERT: {SEVERITY_LEVELS[max_threat['severity']]['action']} **")

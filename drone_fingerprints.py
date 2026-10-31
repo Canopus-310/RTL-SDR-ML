@@ -236,7 +236,8 @@ class DroneFingerprinter:
         # Only match against profiles the RTL-SDR can actually detect
         self.detectable = [p for p in self.profiles if p["detectable_by_rtlsdr"]]
 
-    def match(self, freq_mhz, bandwidth_khz, is_bursty=False, duty_cycle=None):
+    def match(self, freq_mhz, bandwidth_khz, is_bursty=False, duty_cycle=None, hopping=False,
+              lora=False):
         """
         Score a detected signal against all known drone profiles.
 
@@ -245,6 +246,8 @@ class DroneFingerprinter:
             bandwidth_khz: Measured bandwidth in kHz
             is_bursty: Whether the signal appears bursty vs continuous
             duty_cycle: Estimated duty cycle (0-1), None if unknown
+            hopping: Whether the signal was seen frequency hopping (FHSS)
+            lora: Whether the dechirp rule identified LoRa chirp modulation
 
         Returns:
             List of (profile, score, reasons) tuples, sorted by score descending.
@@ -316,15 +319,26 @@ class DroneFingerprinter:
                 elif dc_diff < 0.4:
                     score += 5
 
+            # --- Frequency hopping (0-10 points, total capped at 100) ---
+            if hopping and profile["hopping"]:
+                score = min(score + 10, 100)
+                reasons.append("frequency hopping observed, matching this FHSS link")
+
+            # --- LoRa modulation (0-10 points, total capped at 100) ---
+            if lora and profile["modulation"] == "LoRa":
+                score = min(score + 10, 100)
+                reasons.append("LoRa chirp modulation confirmed by dechirping")
+
             if score > 0:
                 matches.append((profile, score, reasons))
 
         matches.sort(key=lambda x: x[1], reverse=True)
         return matches
 
-    def get_best_match(self, freq_mhz, bandwidth_khz, is_bursty=False, duty_cycle=None):
+    def get_best_match(self, freq_mhz, bandwidth_khz, is_bursty=False, duty_cycle=None,
+                       hopping=False, lora=False):
         """Return the single best matching profile, or None."""
-        matches = self.match(freq_mhz, bandwidth_khz, is_bursty, duty_cycle)
+        matches = self.match(freq_mhz, bandwidth_khz, is_bursty, duty_cycle, hopping, lora)
         if matches and matches[0][1] >= 30:
             return matches[0]
         return None

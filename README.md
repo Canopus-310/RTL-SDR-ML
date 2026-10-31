@@ -117,9 +117,9 @@ python live_scan.py --stream
 
 A reader thread captures 0.5 s IQ blocks into a two-block queue while the main thread analyzes them. If analysis falls behind, the oldest queued block is dropped, so the display stays within a couple of seconds of real time instead of drifting further behind. Analysis currently takes ~1.4 s per 0.5 s block with signals present (less on a quiet band), so expect to analyze roughly one block in three. The status line shows per-block processing time with a per-stage breakdown (`det`, `bw+x`, `feat`, `ml`, `fp`, `thr`, in ms), the block's capture time, the latency from the block finishing capture to its result being printed, and dropped/read counts. The stream summary report includes mean / p95 / max for each stage.
 
-Detections are grouped into **tracks**: a detection joins the nearest track within 20 kHz. The live table shows, per track, the frequency, first/last seen, hits out of blocks spanned, presence %, burstiness and the highest threat score seen. On Ctrl+C a summary is written to `rf_threat_report_stream_<timestamp>.json/.txt`, including the highest-threat detection of each track. No per-block reports are written.
+Detections are grouped into **tracks**: a detection joins the nearest track within 20 kHz. A frequency-hopping emitter is a single track listing the channels seen, hops per second and dwell time, and the stream summary report includes this. Single-channel hops seen in a block are counted towards an emitter already recognised on that channel. The live table shows, per track, the frequency, first/last seen, hits out of blocks spanned, presence %, burstiness and the highest threat score seen. On Ctrl+C a summary is written to `rf_threat_report_stream_<timestamp>.json/.txt`, including the highest-threat detection of each track. No per-block reports are written.
 
-**Burstiness in stream mode** is measured instead of being inferred from the ML class: a track spanning at least 4 analyzed blocks that is present in fewer than 80% of them is bursty (`?` until then, treated as not bursty for scoring). This only sees on/off patterns slower than the 0.5 s block. A transmitter that sends at least once per block, like the 2-packets-per-second LoRa beacon or the synthetic 200 ms-on/300 ms-off telemetry, shows up in every block and is reported as **not** bursty. Sidelobes that flicker in and out between blocks can be reported as bursty.
+**Burstiness** is measured the same way in single scans, `--loop` and `--stream`. It is the duty cycle from the burst detector's own on/off times *within* each capture or block, bursty below 50%. The `Duty` column shows a track's median per-block duty cycle (B = bursty, C = continuous); the `LoRa` column shows whether the dechirp rule fired. A hopping link that transmits in every block is still bursty (~15% duty for the synthetic 4-channel hopper), because its on-time is measured, not just whether it appeared in the block.
 
 ### Troubleshooting
 
@@ -170,7 +170,16 @@ The repo includes a pre-trained model, but you can regenerate it:
 python train_rf_classifier.py
 ```
 
-This generates synthetic training signals across five classes (FM broadcast, drone telemetry, drone video, interference, noise), extracts spectral features, and trains a Random Forest classifier.
+This generates synthetic training signals across six classes (FM broadcast, drone telemetry, drone video, interference, noise, LoRa), extracts 11 features (10 spectral/amplitude features plus the dechirp score), and trains a Random Forest classifier. LoRa snippets vary SF (7–9), bandwidth (125/250/500 kHz), frequency offset, in-band SNR (0–30 dB) and packet count. Every class varies snippet length (15–500 ms) and amplitude (±20 dB), so neither can act as a class cue.
+
+### LoRa dechirp score
+
+```bash
+python lora_dsp.py           # dechirp scores for synthetic LoRa / FM / FSK / noise at 20, 10, 5, 0 dB SNR
+python evaluate_dataset.py   # rule vs ML accuracy on labelled real clips in rf_dataset\lora_hop and rf_dataset\noise
+```
+
+Each detection's own IQ slice is multiplied by the conjugate reference upchirp for each candidate (SF 7–10, BW 125/250/500 kHz) and FFT'd. A LoRa symbol collapses to a single tone; anything else stays spread. The score is the best peak-to-average ratio in dB above what noise gives. The pipeline prints `LoRa: yes/no (score)` next to the ML label. "Yes" (score ≥ 6 dB, chosen from the `lora_dsp.py` table) adds a `LORA_MODULATION` threat factor (+10) and +10 to LoRa fingerprint profiles. `evaluate_dataset.py` suggests a threshold from real labelled recordings.
 
 ### Generating test signals
 
@@ -192,6 +201,10 @@ python drone_fingerprints.py
 |------|---------|
 | `rf_scanner.py` | Main orchestrator — runs the full pipeline |
 | `live_scan.py` | Live capture from the RTL-SDR via pyrtlsdr, then the full pipeline |
+| `burst_detector.py` | Short-time (max-hold) burst detection, duty cycle, FHSS grouping |
+| `lora_dsp.py` | LoRa chirp generation and the dechirp score |
+| `evaluate_dataset.py` | Rule vs ML accuracy and threshold suggestion on labelled real clips |
+| `stage_timer.py` | Per-stage latency measurement |
 | `capture_spectrum.py` | Basic IQ capture and spectrum plot |
 | `signal_detector.py` | Auto-detection with spectrogram |
 | `feature_extractor.py` | Rule-based signal classification |
@@ -214,13 +227,39 @@ The fingerprint database includes RF profiles for common drone communication sys
 
 ## How It Works
 
+**Two detectors run on every capture.** The Welch average over the whole capture finds steady signals with a very stable noise floor. But it dilutes short bursts by their duty cycle: a 15 ms hop loses ~21 dB in a 2 s scan and ~15 dB in a 0.5 s block. The burst detector (`burst_detector.py`) looks at ~4 ms slices instead, each averaging 19 FFTs, with a max-hold per frequency bin:
+
+- *Threshold.* Each bin's noise is its median over time. The burst threshold is set from the noise statistics for a false-alarm rate of 10⁻⁶ per bin per slice (4.0 dB), with a 6 dB floor for real-dongle spurs and quantization. A burst must also span ≥3 adjacent bins. Max-hold without slice averaging would push the noise up ~11 dB over 2 s; averaging 19 FFTs per slice keeps that to ~3 dB.
+- *Clean-up.* Narrow lines that are always on (the DC spike, spurs) are removed. Weak bursts that only occur during a ≥20 dB stronger one (keying splatter, spurs from a strong nearby transmitter) are ignored, and so are slivers cut off at the capture edges.
+- *Each burst* gets a start time, duration (re-measured at ~0.2 ms resolution), center frequency and bandwidth (−6 dB). Bursts are grouped into channels, and a channel's duty cycle tells intermittent signals from continuous ones.
+
+Then the two are combined:
+
+- Welch peaks inside the same intermittent channel are one signal. This merges the two halves of a LoRa signal split by the DC notch, and keyed-carrier sidelobes.
+- A signal backed by bursts takes its ML features from the IQ of its strongest burst, not the first 0.5 s.
+- **FHSS:** three or more intermittent channels with similar bandwidth, whose bursts alternate channels and rarely overlap in time, are reported as one frequency-hopping emitter. It gets its channel list, hop rate and dwell time, +10 to the fingerprint match for hopping profiles and a +15 `FREQUENCY_HOPPING` threat factor.
+- Steady signals (FM, CW) go through the original path unchanged.
+
+**Verdict.** Each emitter (and each `--stream` track, using evidence gathered across its blocks) gets a final verdict with explicit reasons, separate from the ML label (`threat_engine.decide_verdict`):
+
+| Verdict | Rule | Score range |
+|---|---|---|
+| `DRONE_CONTROL_TELEMETRY_LINK` | LoRa (dechirp rule or ML `LORA`) + FHSS + ≥8 hops/s + bursty + inside a drone band | 60–100 (only verdict that reaches HIGH/CRITICAL) |
+| `FSK_TELEMETRY` | Not LoRa, bursty, ≤60 kHz, ML `DRONE_TELEMETRY` or a SiK fingerprint | 0–59 |
+| `POSSIBLE_IOT_LORA` | LoRa that fails the drone-link test: slow or no hopping, low packet rate, 125 kHz (LoRaWAN-like; 865–867 MHz smart meters and sensors in India) | 0–35 |
+| `NOT_DRONE` | Everything else (FM, noise, interference) | 0–19 |
+
+The verdict bounds the factor score below it, so the verdict sets the overall threat level. The verdict and its reasons are the headline of each signal in the console output, the single-scan report and the stream summary, and they appear as a column in the live track table. `generate_test_signals.py` writes `synthetic_lorawan.wav` (SF9/125 kHz, one packet every ~3 s on 3 fixed IN865 channels, 10 s; analyze at 866000000) to check this.
+
 The threat assessment scores each detected signal across multiple factors: frequency band membership (is it in a known drone band?), ML classification result, fingerprint match strength, signal bandwidth, burst pattern, and signal strength (proximity). These combine into a 0–100 threat score mapped to severity levels (NONE / LOW / MEDIUM / HIGH / CRITICAL), with transparent per-factor reasoning so every score can be explained.
 
 ## Limitations and Honest Notes
 
+- **LoRa is not only drones:** the dechirp rule and the LORA class identify LoRa modulation, which LoRaWAN IoT sensors at 868 MHz also use. A LoRa hit raises the threat score; it does not prove a drone.
 - **Synthetic training data:** The ML model is trained on synthetic signals. It achieves high accuracy on synthetic test data but shows reduced confidence (~50–65%) on real-world captures — a demonstration of the domain gap between synthetic and real RF data. Real-world deployment would benefit from retraining on captured samples.
 - **Real-world validation:** Testing has been done on real FM broadcast captures (104 MHz) and synthetic signals at drone bands (433/915 MHz). The pipeline is designed for sub-GHz ISM monitoring but has not been tested on actual captured drone RF data.
-- **Sidelobe detection:** The detector can pick up spectral sidelobes of strong signals as separate detections.
+- **Sidelobe detection:** The Welch detector can pick up spectral sidelobes of strong *steady* signals as separate detections. Sidelobes of bursty signals are merged into the burst's channel.
+- **FHSS needs ≥3 channels in one capture/block.** With fewer, the hops are reported per channel (in `--stream` they are still attributed to an emitter already recognised on those channels). Burst timing resolution is ~0.2 ms; burst frequency resolution is ~4.7 kHz.
 - **LoRa systems overlap:** Crossfire, ExpressLRS, and FrSky R9 share frequency bands and can't be distinguished by frequency alone — the fingerprint matcher reports all plausible matches.
 - **Receive-only:** This is a passive monitoring tool. The RTL-SDR cannot transmit.
 

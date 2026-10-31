@@ -22,6 +22,13 @@ from drone_fingerprints import DroneFingerprinter
 from threat_engine import ThreatEngine
 from scan_report import ScanReport
 from stage_timer import StageTimer
+from burst_detector import (short_time_spectrum, detect_bursts, refine_burst_timing,
+                            group_channels, find_fhss_emitters, CONTINUOUS_DUTY)
+from lora_dsp import dechirp_score, LORA_THRESHOLD_DB
+
+# Burst detection uses a 6 dB threshold; a burst channel with no Welch peak and no
+# FHSS grouping to back it up is only reported if it reaches this SNR.
+BURST_ONLY_MIN_SNR_DB = 12.0
 
 
 def load_recording(path):
@@ -51,15 +58,25 @@ def detect_signals(iq, sample_rate, center_freq):
     return freqs, freqs_hz, freqs_mhz, psd_db, noise_floor, threshold, peaks, props
 
 
-def extract_signal_iq(iq, sample_rate, freqs, peak_idx, bw_hz):
-    """Extract a signal's IQ using FFT bandpass filter."""
-    chunk = iq[:int(0.5 * sample_rate)]
+def extract_signal_iq(iq, sample_rate, center_hz, bw_hz, window_s=None):
+    """
+    Extract a signal's IQ using an FFT bandpass filter around center_hz (offset from tune).
+
+    window_s is the (start, stop) time in seconds to take the IQ from, capped at
+    0.5 s; by default the first 0.5 s of the capture. Returns (iq, (start_s, stop_s)).
+    """
+    max_len = int(0.5 * sample_rate)
+    if window_s is None:
+        start, stop = 0, max_len
+    else:
+        start = int(window_s[0] * sample_rate)
+        stop = min(int(window_s[1] * sample_rate), start + max_len)
+    chunk = iq[start:stop]
     fft_iq = np.fft.fft(chunk)
     fft_freqs = np.fft.fftfreq(len(fft_iq), 1 / sample_rate)
-    sig_center = freqs[peak_idx]
     half_bw = max(bw_hz, 50000) / 2
-    mask = np.abs(fft_freqs - sig_center) < half_bw
-    return np.fft.ifft(fft_iq * mask)
+    mask = np.abs(fft_freqs - center_hz) < half_bw
+    return np.fft.ifft(fft_iq * mask), (start / sample_rate, (start + len(chunk)) / sample_rate)
 
 
 def estimate_bandwidth(freqs_hz, psd_db, peak_idx, noise_floor):
@@ -119,19 +136,146 @@ def extract_ml_features(iq, sample_rate):
             duty_cycle, num_peaks]
 
 
+def plan_targets(freqs, psd_db, peaks, channels, emitters, spectrum):
+    """
+    Decide what gets analyzed: one target per reported signal, sorted by frequency.
+
+      "welch"        a Welch peak outside any intermittent channel: analyzed as
+                     before, with IQ from the first 0.5 s
+      "welch+burst"  Welch peaks inside the same intermittent channel (e.g. one
+                     LoRa beacon split in two by the DC notch): merged into one
+                     target at the strongest peak, IQ from the channel's strongest burst
+      "burst"        an intermittent channel the Welch average missed, if its
+                     strongest burst is BURST_ONLY_MIN_SNR_DB over noise (a lone
+                     weak burst is the likeliest false alarm, so it needs more margin)
+      "fhss"         a frequency-hopping emitter; Welch peaks on its channels are
+                     absorbed into it
+
+    Only intermittent channels with a stable center count; continuous ones are
+    left to the Welch detector. A "welch" target is marked steady when it sits
+    on a continuous channel or an always-on narrow line (on 100% of the time).
+    """
+    intermittent = [ch for ch in channels if not ch["continuous"] and ch["stable"]]
+    hopping = {id(ch) for e in emitters for ch in e["channels"]}
+    line_freqs = spectrum["freqs"][spectrum["line_bins"]]
+
+    def channel_at(f):
+        inside = [ch for ch in intermittent if ch["f_lo_hz"] <= f <= ch["f_hi_hz"]]
+        return min(inside, key=lambda ch: abs(ch["center_hz"] - f), default=None)
+
+    def steady_at(f):
+        return (any(ch["continuous"] and ch["f_lo_hz"] <= f <= ch["f_hi_hz"] for ch in channels)
+                or bool(np.any(np.abs(line_freqs - f) <= spectrum["bin_hz"])))
+
+    targets, merged = [], {}
+    for i, peak in enumerate(peaks):
+        ch = channel_at(freqs[peak])
+        if ch is None:
+            targets.append({"kind": "welch", "peak": peak, "index": i, "center_hz": freqs[peak],
+                            "steady": steady_at(freqs[peak])})
+        elif id(ch) not in hopping:
+            best = merged.get(id(ch))
+            if best is None or psd_db[peak] > psd_db[best["peak"]]:
+                merged[id(ch)] = {"kind": "welch+burst", "peak": peak, "index": i,
+                                  "center_hz": freqs[peak], "channel": ch}
+    targets += merged.values()
+    targets += [{"kind": "burst", "channel": ch, "center_hz": ch["center_hz"]}
+                for ch in intermittent if id(ch) not in merged and id(ch) not in hopping
+                and ch["snr_db"] >= BURST_ONLY_MIN_SNR_DB]
+    targets += [{"kind": "fhss", "emitter": e, "center_hz": e["center_hz"]} for e in emitters]
+    return sorted(targets, key=lambda t: t["center_hz"])
+
+
+def measured_duty(bursts, capture_s):
+    """Fraction of the capture the bursts were on (refined burst durations), capped at 1."""
+    return min(1.0, sum(b["duration_s"] for b in bursts) / capture_s)
+
+
+def describe_target(target, center_freq, freqs_hz, psd_db, props, noise_floor, capture_s):
+    """
+    Frequency, power, bandwidth, IQ window and measured duty cycle for one target.
+
+    Welch-based targets keep the Welch peak's power, prominence and -20 dB
+    bandwidth. Burst-based targets use the burst PSD (comparable to Welch's dB
+    scale), the burst SNR as prominence and the burst's -6 dB bandwidth. Any
+    target backed by bursts takes its IQ from the strongest burst.
+
+    duty_cycle is the measured on-time over the capture: the target's bursts
+    (all hops for an FHSS emitter), 1.0 for a steady Welch signal, or None when
+    the burst detector saw nothing to measure. is_bursty means duty < CONTINUOUS_DUTY.
+    """
+    info = _target_signal(target, center_freq, freqs_hz, psd_db, props, noise_floor)
+    kind = target["kind"]
+    if kind == "welch":
+        duty, bursts = (1.0 if target["steady"] else None), []
+    else:
+        bursts = target["emitter" if kind == "fhss" else "channel"]["bursts"]
+        duty = measured_duty(bursts, capture_s)
+    info["duty_cycle"] = duty
+    info["is_bursty"] = duty is not None and duty < CONTINUOUS_DUTY
+    # Packets (bursts) per second over the capture; None for a steady signal
+    info["bursts"] = len(bursts)
+    info["packet_rate_hz"] = len(bursts) / capture_s if bursts else None
+    return info
+
+
+def _target_signal(target, center_freq, freqs_hz, psd_db, props, noise_floor):
+    """Frequency, power, prominence, bandwidth, IQ center/window and FHSS info of a target."""
+    kind = target["kind"]
+    if kind in ("welch", "welch+burst"):
+        peak = target["peak"]
+        bw_hz, _, _ = estimate_bandwidth(freqs_hz, psd_db, peak, noise_floor)
+        info = {"freq_mhz": (freqs_hz[peak]) / 1e6, "power_db": psd_db[peak],
+                "prominence_db": float(props["prominences"][target["index"]]),
+                "bw_hz": bw_hz, "iq_center_hz": target["center_hz"], "iq_bw_hz": bw_hz,
+                "window_s": None, "fhss": None}
+        if kind == "welch+burst":
+            # Report the channel center: which merged Welch peak is strongest varies between captures
+            ch = target["channel"]
+            info["freq_mhz"] = (ch["center_hz"] + center_freq) / 1e6
+            info["iq_center_hz"] = ch["center_hz"]
+            b = ch["strongest"]
+            info["window_s"] = (b["start_s"], b["start_s"] + b["duration_s"])
+        return info
+
+    source = target["channel"] if kind == "burst" else target["emitter"]
+    b = source["strongest"]
+    info = {"freq_mhz": (source["center_hz"] + center_freq) / 1e6, "power_db": source["peak_db"],
+            "prominence_db": source["snr_db"], "bw_hz": source["bandwidth_hz"],
+            "iq_center_hz": b["center_hz"], "iq_bw_hz": b["bandwidth_hz"],
+            "window_s": (b["start_s"], b["start_s"] + b["duration_s"]), "fhss": None}
+    if kind == "fhss":
+        e = target["emitter"]
+        info["fhss"] = {
+            "channels_mhz": [round(float(ch["center_hz"] + center_freq) / 1e6, 3) for ch in e["channels"]],
+            "hops": len(e["bursts"]),
+            "hop_rate_hz": round(e["hop_rate_hz"], 2),
+            "dwell_ms": round(1000 * e["dwell_s"], 1),
+            "hop_interval_ms": round(1000 * e["hop_interval_s"], 1),
+            "channel_bandwidth_khz": round(e["bandwidth_hz"] / 1e3, 1),
+        }
+    return info
+
+
 def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
-               verbose=True, burst_lookup=None, timer=None):
+               verbose=True, timer=None):
     """
     Detect, classify, fingerprint and threat-assess every signal in an IQ capture.
 
+    Two detectors run side by side: the Welch average (steady signals) and the
+    short-time burst detector (bursts and frequency hopping, see
+    burst_detector.py); plan_targets combines them into one target per signal.
+
     Returns (detections, noise_floor): a list of detection dicts (one per
-    detected peak, in the format ScanReport.add_detection expects) and the
+    detected signal, in the format ScanReport.add_detection expects) and the
     estimated noise floor in dB.
 
-    verbose=False suppresses the console output. burst_lookup, if given, is
-    called as burst_lookup(freq_mhz) -> bool to decide whether a signal is
-    bursty; otherwise burstiness is inferred from the ML class. timer, if
-    given, is a StageTimer that receives the time spent in each stage.
+    Burstiness is measured (duty cycle from the burst detector's on/off times)
+    and LoRa modulation is checked with the dechirp score on each target's own
+    IQ slice; both feed fingerprint matching and the threat score.
+
+    verbose=False suppresses the console output. timer, if given, is a
+    StageTimer that receives the time spent in each stage.
     """
     log = print if verbose else (lambda *args, **kwargs: None)
     if timer is None:
@@ -142,48 +286,73 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
     with timer.stage("detection"):
         (freqs, freqs_hz, freqs_mhz, psd_db,
          noise_floor, threshold, peaks, props) = detect_signals(iq, sample_rate, center_freq)
-    timer.signals += len(peaks)
 
     log(f"    Noise floor: {noise_floor:.1f} dB")
     log(f"    Threshold:   {threshold:.1f} dB")
-    log(f"    Signals detected: {len(peaks)}")
+    log(f"    Signals detected (Welch average): {len(peaks)}")
+
+    # --- Short-time burst detection, FHSS grouping, merge with Welch ---
+    with timer.stage("bursts"):
+        spectrum = short_time_spectrum(iq, sample_rate)
+        bursts = refine_burst_timing(detect_bursts(spectrum), iq, sample_rate, spectrum)
+        channels = group_channels(bursts, spectrum)
+        emitters = find_fhss_emitters(channels)
+        targets = plan_targets(freqs, psd_db, peaks, channels, emitters, spectrum)
+    timer.signals += len(targets)
+
+    n_intermittent = sum(1 for ch in channels if not ch["continuous"] and ch["stable"])
+    log(f"    Burst scan: {len(spectrum['power'])} slices of {spectrum['slice_s']*1000:.1f} ms, "
+        f"threshold {spectrum['threshold_db']:.1f} dB over noise")
+    log(f"    Bursts: {len(bursts)} in {n_intermittent} intermittent channel(s)"
+        + (f" ({spectrum['artifacts']} spur/splatter bursts ignored)" if spectrum["artifacts"] else ""))
+    for e in emitters:
+        log(f"    FHSS emitter: {len(e['channels'])} channels, {len(e['bursts'])} hops, "
+            f"{e['hop_rate_hz']:.1f} hops/s, dwell {e['dwell_s']*1000:.1f} ms")
 
     detections = []
 
     # --- Process each detection ---
-    if len(peaks) == 0:
+    if len(targets) == 0:
         log("\n[*] No signals above threshold — band appears clear.")
     else:
-        log(f"\n[*] Analyzing {len(peaks)} detected signal(s)...\n")
+        log(f"\n[*] Analyzing {len(targets)} detected signal(s)...\n")
 
-    for i, peak in enumerate(peaks):
-        freq_mhz = freqs_mhz[peak]
-        power = psd_db[peak]
-        prominence = props["prominences"][i]
-
-        # Bandwidth + signal extraction
+    for i, target in enumerate(targets):
+        # Bandwidth + signal extraction (IQ from the burst's own time slice if it has one)
         with timer.stage("extraction"):
-            bw_hz, left, right = estimate_bandwidth(freqs_hz, psd_db, peak, noise_floor)
-            sig_iq = extract_signal_iq(iq, sample_rate, freqs, peak, bw_hz)
+            info = describe_target(target, center_freq, freqs_hz, psd_db, props, noise_floor,
+                                   len(iq) / sample_rate)
+            sig_iq, iq_window = extract_signal_iq(iq, sample_rate, info["iq_center_hz"],
+                                                  info["iq_bw_hz"], info["window_s"])
+        freq_mhz = info["freq_mhz"]
+        power = info["power_db"]
+        prominence = info["prominence_db"]
+        bw_hz = info["bw_hz"]
         bw_khz = bw_hz / 1000
+        fhss = info["fhss"]
+        duty = info["duty_cycle"]
+        is_bursty = info["is_bursty"]
 
-        # ML classification
+        # Features: the 10 spectral/amplitude features plus the dechirp score,
+        # computed on this target's own raw IQ slice around its center
         with timer.stage("features"):
-            features = extract_ml_features(sig_iq, sample_rate)
+            raw = iq[int(iq_window[0] * sample_rate):int(iq_window[1] * sample_rate)]
+            lora = dechirp_score(raw, sample_rate, info["iq_center_hz"])
+            is_lora = lora["score_db"] >= LORA_THRESHOLD_DB
+            features = extract_ml_features(sig_iq, sample_rate) + [lora["score_db"]]
         with timer.stage("ml"):
             ml_class = clf.predict([features])[0]
             ml_proba = clf.predict_proba([features])[0]
             ml_confidence = float(np.max(ml_proba))
 
-        # Fingerprint matching
-        if burst_lookup is not None:
-            is_bursty = burst_lookup(freq_mhz)
-        else:
-            is_bursty = ml_class in ["DRONE_TELEMETRY", "NARROWBAND_SIGNAL"]
+        # Fingerprint matching with the measured burstiness/duty cycle
         with timer.stage("fingerprint"):
             fp_match = fingerprinter.get_best_match(
                 freq_mhz=freq_mhz, bandwidth_khz=bw_khz,
-                is_bursty=is_bursty)
+                is_bursty=is_bursty, duty_cycle=duty,
+                hopping=fhss is not None, lora=is_lora)
+        lora_info = ({"score_db": round(lora["score_db"], 1), "sf": lora["sf"],
+                      "bw_khz": lora["bw_hz"] / 1e3} if is_lora else None)
 
         # Threat assessment
         with timer.stage("threat"):
@@ -195,21 +364,37 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
                 "ml_confidence": ml_confidence,
                 "fingerprint_match": fp_match,
                 "is_bursty": is_bursty,
+                "duty_cycle": duty,
+                "fhss": fhss,
+                "lora": lora_info,
+                "dechirp_score_db": lora["score_db"],
+                "packet_rate_hz": info["packet_rate_hz"],
             })
 
         # Print live result
         sev = assessment["severity"]
         score = assessment["threat_score"]
+        kind = {"welch": "", "welch+burst": "  |  burst", "burst": "  |  burst only",
+                "fhss": "  |  FHSS"}[target["kind"]]
+        lora_text = (f"LoRa: yes ({lora['score_db']:.1f} dB, SF{lora['sf']}/{lora['bw_hz']/1e3:.0f}k)"
+                     if is_lora else f"LoRa: no ({lora['score_db']:.1f} dB)")
+        duty_text = "duty ?" if duty is None else f"duty {duty:.0%}{' bursty' if is_bursty else ''}"
         log(f"  Signal {i+1}: {freq_mhz:.3f} MHz  |  {bw_khz:.0f} kHz  |  "
-              f"ML: {ml_class} ({ml_confidence:.0%})  |  "
-              f"Threat: {score}/100 ({sev})")
+              f"ML: {ml_class} ({ml_confidence:.0%})  |  {lora_text}  |  {duty_text}  |  "
+              f"Threat: {score}/100 ({sev}){kind}")
 
         if fp_match:
             profile, fp_score, _ = fp_match
             log(f"           Fingerprint: {profile['name']} ({fp_score}/100)")
+        if fhss:
+            log(f"           FHSS: {', '.join(f'{c:.3f}' for c in fhss['channels_mhz'])} MHz  |  "
+                f"{fhss['hop_rate_hz']:.1f} hops/s  |  dwell {fhss['dwell_ms']:.1f} ms")
+        log(f"           Verdict: {assessment['verdict']} — {'; '.join(assessment['verdict_reasons'])}")
 
         # Add to report
         detection_record = {
+            "verdict": assessment["verdict"],
+            "verdict_reasons": assessment["verdict_reasons"],
             "freq_mhz": round(freq_mhz, 3),
             "power_db": round(power, 1),
             "bandwidth_khz": round(bw_khz, 1),
@@ -217,12 +402,25 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
             "ml_class": ml_class,
             "ml_confidence": round(ml_confidence, 2),
             "fingerprint_name": fp_match[0]["name"] if fp_match else None,
+            "fingerprint_id": fp_match[0]["id"] if fp_match else None,
             "fingerprint_score": fp_match[1] if fp_match else None,
             "threat_score": score,
             "threat_severity": sev,
             "threat_factors": assessment["factors"],
             "recommendations": assessment["recommendations"],
+            "detected_by": target["kind"],
+            "iq_window_s": [round(iq_window[0], 4), round(iq_window[1], 4)],
+            "duty_cycle": None if duty is None else round(duty, 3),
+            "is_bursty": is_bursty,
+            "bursts": info["bursts"],
+            "packet_rate_hz": None if info["packet_rate_hz"] is None else round(info["packet_rate_hz"], 3),
+            "dechirp_score_db": round(lora["score_db"], 1),
+            "lora_rule": bool(is_lora),
+            "lora_sf": lora["sf"] if is_lora else None,
+            "lora_bw_khz": lora["bw_hz"] / 1e3 if is_lora else None,
         }
+        if fhss:
+            detection_record["fhss"] = fhss
         detections.append(detection_record)
 
     return detections, noise_floor

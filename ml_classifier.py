@@ -11,9 +11,11 @@ import json
 import sys
 from datetime import datetime
 
+from lora_dsp import dechirp_score
+
 
 def extract_features(iq, sample_rate):
-    """Extract the same 10 features used in training."""
+    """Extract the first 10 features used in training (the dechirp score is appended by the caller)."""
     freqs, psd = welch(iq, fs=sample_rate, nperseg=min(1024, len(iq)), return_onesided=False)
     psd_db = 10 * np.log10(np.fft.fftshift(psd) + 1e-20)
     freqs = np.fft.fftshift(freqs)
@@ -132,13 +134,15 @@ def main():
         sig_chunk = np.fft.ifft(fft_filtered)
 
         # ML classification
-        features = extract_features(sig_chunk, sample_rate)
+        raw_chunk = iq[:int(0.5 * sample_rate)]
+        features = extract_features(sig_chunk, sample_rate) + [
+            dechirp_score(raw_chunk, sample_rate, sig_center_offset)["score_db"]]
         ml_class = clf.predict([features])[0]
         ml_proba = clf.predict_proba([features])[0]
         confidence = np.max(ml_proba)
 
         # Threat assessment
-        if ml_class in ["DRONE_TELEMETRY", "DRONE_VIDEO"]:
+        if ml_class in ["DRONE_TELEMETRY", "DRONE_VIDEO", "LORA"]:
             threat = "ALERT - potential drone signal"
         elif ml_class == "INTERFERENCE":
             threat = "WARNING - unknown interference"
@@ -192,7 +196,8 @@ def main():
 
     colors = {
         "FM_BROADCAST": "green", "DRONE_TELEMETRY": "red",
-        "DRONE_VIDEO": "orange", "INTERFERENCE": "purple", "NOISE": "gray"
+        "DRONE_VIDEO": "orange", "INTERFERENCE": "purple", "NOISE": "gray",
+        "LORA": "magenta"
     }
     for r, peak in zip(results, peaks):
         c = colors.get(r["classification"], "blue")

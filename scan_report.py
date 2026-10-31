@@ -40,6 +40,10 @@ class ScanReport:
         for d in self.detections:
             sev = d.get("threat_severity", "NONE")
             threat_counts[sev] = threat_counts.get(sev, 0) + 1
+        verdict_counts = {}
+        for d in self.detections:
+            v = d.get("verdict", "UNKNOWN")
+            verdict_counts[v] = verdict_counts.get(v, 0) + 1
 
         drone_detections = [d for d in self.detections
                            if d.get("threat_score", 0) >= 40]
@@ -73,6 +77,7 @@ class ScanReport:
                 "total_signals": len(self.detections),
                 "drone_candidates": len(drone_detections),
                 "threat_counts": threat_counts,
+                "verdict_counts": verdict_counts,
             },
             "detections": self.detections,
         }
@@ -117,6 +122,9 @@ class ScanReport:
                 counts = ", ".join(f"{k}: {v}" for k, v in
                                  summary["threat_counts"].items())
                 f.write(f"By Severity:       {counts}\n")
+            if summary["verdict_counts"]:
+                verdicts = ", ".join(f"{k}: {v}" for k, v in summary["verdict_counts"].items())
+                f.write(f"Verdicts:          {verdicts}\n")
             f.write("\n")
 
             f.write("DETAILED DETECTIONS\n")
@@ -125,7 +133,10 @@ class ScanReport:
             for i, d in enumerate(self.detections):
                 sev = d.get("threat_severity", "NONE")
                 score = d.get("threat_score", 0)
-                f.write(f"\n  Signal {i+1}: {d['freq_mhz']:.3f} MHz\n")
+                f.write(f"\n  Signal {i+1}: {d['freq_mhz']:.3f} MHz  —  "
+                        f"VERDICT: {d.get('verdict', 'UNKNOWN')}\n")
+                for reason in d.get("verdict_reasons", []):
+                    f.write(f"    - {reason}\n")
                 f.write(f"  {'.'*50}\n")
                 f.write(f"  Power:          {d.get('power_db', 'N/A'):.1f} dB\n")
                 f.write(f"  Bandwidth:      {d.get('bandwidth_khz', 'N/A'):.1f} kHz\n")
@@ -138,6 +149,22 @@ class ScanReport:
                     f.write(f" ({d.get('fingerprint_score', 0)}/100)\n")
                 else:
                     f.write(f"  Fingerprint:    No match\n")
+
+                if "dechirp_score_db" in d:
+                    lora = (f"yes (SF{d['lora_sf']}, {d['lora_bw_khz']:.0f} kHz)"
+                            if d.get("lora_rule") else "no")
+                    f.write(f"  LoRa:           {lora}, dechirp score {d['dechirp_score_db']:.1f} dB\n")
+                    duty = d.get("duty_cycle")
+                    f.write(f"  Duty Cycle:     "
+                            + ("unknown" if duty is None else
+                               f"{duty:.0%} ({'bursty' if d.get('is_bursty') else 'continuous'})")
+                            + "\n")
+
+                fhss = d.get("fhss")
+                if fhss:
+                    channels = ", ".join(f"{c:.3f}" for c in fhss["channels_mhz"])
+                    f.write(f"  FHSS:           {len(fhss['channels_mhz'])} channels ({channels} MHz), "
+                            f"{fhss['hop_rate_hz']:.1f} hops/s, dwell {fhss['dwell_ms']:.1f} ms\n")
 
                 f.write(f"  Threat Score:   {score}/100 ({sev})\n")
 

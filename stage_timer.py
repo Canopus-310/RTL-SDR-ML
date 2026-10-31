@@ -20,6 +20,7 @@ import numpy as np
 STAGES = [
     ("capture", "Capture (incl. settle)", "cap"),
     ("detection", "Detection", "det"),
+    ("bursts", "Burst detection + FHSS", "bst"),
     ("extraction", "Bandwidth + extraction", "bw+x"),
     ("features", "Feature extraction", "feat"),
     ("ml", "ML classification", "ml"),

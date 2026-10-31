@@ -9,14 +9,16 @@
     "freq_std_hz",
     "freq_range_hz",
     "duty_cycle",
-    "num_spectral_peaks"
+    "num_spectral_peaks",
+    "dechirp_score_db"
   ],
   "classes": [
     "FM_BROADCAST",
     "DRONE_TELEMETRY",
     "DRONE_VIDEO",
     "INTERFERENCE",
-    "NOISE"
+    "NOISE",
+    "LORA"
   ],
   "accuracy": 1.0,
   "sample_rate": 2400000
