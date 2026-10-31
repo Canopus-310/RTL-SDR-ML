@@ -63,7 +63,71 @@ cd rtl-drone-rf
 pip install -r requirements.txt
 ```
 
-For live capture from hardware, you'll also need a working RTL-SDR driver setup (e.g. Zadig + WinUSB on Windows). Recordings can also be made with SDR++ and analyzed offline — no special drivers needed for the analysis pipeline itself.
+For live capture straight from the dongle, see [Live capture with pyrtlsdr](#live-capture-with-pyrtlsdr) below. Recordings can also be made with SDR++ and analyzed offline — no special drivers needed for the analysis pipeline itself.
+
+## Live capture with pyrtlsdr
+
+`live_scan.py` replaces the SDR++ record step: it tunes the RTL-SDR directly, captures baseband IQ at 2.4 MS/s, and runs the same pipeline as `rf_scanner.py`.
+
+### Windows setup (once)
+
+1. **WinUSB driver (Zadig).** Plug in the dongle, run [Zadig](https://zadig.akeo.ie), choose *Options → List All Devices*, select the dongle (e.g. *NESDR SMArt v5*, or *Bulk-In, Interface (Interface 0)*), check the USB ID reads **0BDA 2838**, select **WinUSB** and click *Install/Replace Driver*. Don't pick your mouse/keyboard receiver, webcam or Bluetooth — replacing their driver breaks them. If SDR++ already works with the dongle, this is already done.
+2. **Python packages.** `pyrtlsdr` is only a wrapper — on Windows it also needs `rtlsdr.dll` and `libusb-1.0.dll`, which it doesn't ship. `pyrtlsdrlib` bundles them and pyrtlsdr picks it up automatically. Both are in `requirements.txt`; to install them on their own:
+
+   ```bash
+   pip install pyrtlsdr pyrtlsdrlib
+   ```
+
+   Without `pyrtlsdrlib`, `import rtlsdr` fails with *"Error loading librtlsdr. Make sure librtlsdr (and all of its dependencies) are in your path"*.
+3. **Check it.** With the dongle plugged in, this should print `1`:
+
+   ```bash
+   python -c "from rtlsdr.librtlsdr import librtlsdr; print(librtlsdr.rtlsdr_get_device_count())"
+   ```
+
+### Running
+
+**Stop SDR++ first** (or close it) — only one program can open the dongle at a time.
+
+```bash
+python live_scan.py                                # 5 s at 865.8 MHz, gain ~15 dB
+python live_scan.py --freq 433900000 --gain 30     # different band / gain
+python live_scan.py --save-wav                     # also keep the IQ recording
+python live_scan.py --loop                         # rescan until Ctrl+C
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--freq` | `865800000` | Center frequency in Hz. Tune ~0.2 MHz below the signal of interest so it stays clear of the dongle's DC spike at the exact center. |
+| `--gain` | `15` | Tuner gain in dB. The R820T2 only supports fixed steps, so this snaps to the nearest one (15 → 14.4 dB); the actual value and all steps are printed. |
+| `--duration` | `5` | Seconds of IQ per scan. |
+| `--loop` | off | Repeat scans until Ctrl+C; the dongle is closed cleanly on exit. |
+| `--stream` | off | Continuous mode (see below). Can't be combined with `--loop` or `--save-wav`; `--duration` is ignored. |
+| `--save-wav` | off | Save each capture as `baseband_<freq>Hz_<HH-MM-SS>_<DD-MM-YYYY>.wav` (stereo Int16, same as SDR++'s baseband recorder), so it can be re-analyzed with `rf_scanner.py`. |
+
+Each scan discards the first 0.2 s after tuning (PLL settling and stale USB buffer data), reads in 256k-sample chunks, and writes the usual `rf_threat_report_<timestamp>.json/.txt`. Manual gain is used and the RTL2832 digital AGC is off, so levels are comparable between scans.
+
+### Stream mode
+
+```bash
+python live_scan.py --stream
+```
+
+A reader thread captures 0.5 s IQ blocks into a two-block queue while the main thread analyzes them. If analysis falls behind, the oldest queued block is dropped, so the display stays within a couple of seconds of real time instead of drifting further behind. Analysis currently takes ~1.4 s per 0.5 s block with signals present (less on a quiet band), so expect to analyze roughly one block in three. The status line shows per-block processing time, lag, and dropped/read counts.
+
+Detections are grouped into **tracks**: a detection joins the nearest track within 20 kHz. The live table shows, per track, the frequency, first/last seen, hits out of blocks spanned, presence %, burstiness and the highest threat score seen. On Ctrl+C a summary is written to `rf_threat_report_stream_<timestamp>.json/.txt`, including the highest-threat detection of each track. No per-block reports are written.
+
+**Burstiness in stream mode** is measured instead of being inferred from the ML class: a track spanning at least 4 analyzed blocks that is present in fewer than 80% of them is bursty (`?` until then, treated as not bursty for scoring). This only sees on/off patterns slower than the 0.5 s block. A transmitter that sends at least once per block, like the 2-packets-per-second LoRa beacon or the synthetic 200 ms-on/300 ms-off telemetry, shows up in every block and is reported as **not** bursty. Sidelobes that flicker in and out between blocks can be reported as bursty.
+
+### Troubleshooting
+
+| Message | Fix |
+|---------|-----|
+| `pyrtlsdr could not load librtlsdr (rtlsdr.dll)` | `pip install pyrtlsdrlib` |
+| `No RTL-SDR dongle found` | Plug the dongle in (try another USB port). |
+| `Another program is using the dongle` | Press Stop in SDR++ or close it (and any other SDR software). |
+| `The dongle is not using the WinUSB driver` | Redo the Zadig step, then unplug and replug. |
+| `RTL-SDR error ... Could not read` | The dongle was unplugged or grabbed mid-scan; replug and re-run. |
 
 ## Usage
 
@@ -125,6 +189,7 @@ python drone_fingerprints.py
 | File | Purpose |
 |------|---------|
 | `rf_scanner.py` | Main orchestrator — runs the full pipeline |
+| `live_scan.py` | Live capture from the RTL-SDR via pyrtlsdr, then the full pipeline |
 | `capture_spectrum.py` | Basic IQ capture and spectrum plot |
 | `signal_detector.py` | Auto-detection with spectrogram |
 | `feature_extractor.py` | Rule-based signal classification |

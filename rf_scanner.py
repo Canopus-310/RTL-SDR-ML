@@ -118,66 +118,37 @@ def extract_ml_features(iq, sample_rate):
             duty_cycle, num_peaks]
 
 
-def main():
-    # --- Parse arguments ---
-    if len(sys.argv) < 3:
-        print("Usage: python rf_scanner.py <recording.wav> <center_freq_hz>")
-        print("Example: python rf_scanner.py synthetic_drone_telemetry.wav 433900000")
-        return
+def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
+               verbose=True, burst_lookup=None):
+    """
+    Detect, classify, fingerprint and threat-assess every signal in an IQ capture.
 
-    recording_path = sys.argv[1]
-    center_freq = float(sys.argv[2])
+    Returns (detections, noise_floor): a list of detection dicts (one per
+    detected peak, in the format ScanReport.add_detection expects) and the
+    estimated noise floor in dB.
 
-    # --- Load components ---
-    print("=" * 60)
-    print("RTL-SDR DRONE RF THREAT SCANNER")
-    print("=" * 60)
-
-    print("\n[*] Loading components...")
-    try:
-        clf = joblib.load("rf_classifier_model.joblib")
-        with open("rf_classifier_config.json") as f:
-            config = json.load(f)
-        print(f"    ML model loaded ({config['accuracy']:.0%} accuracy)")
-    except FileNotFoundError:
-        print("    [!] ML model not found — run train_rf_classifier.py first")
-        return
-
-    fingerprinter = DroneFingerprinter()
-    print(f"    Fingerprint DB loaded ({len(fingerprinter.detectable)} drone profiles)")
-
-    threat_engine = ThreatEngine()
-    print(f"    Threat engine ready")
-
-    # --- Load and analyze recording ---
-    print(f"\n[*] Loading recording: {recording_path}")
-    try:
-        iq, sample_rate = load_recording(recording_path)
-    except Exception as e:
-        print(f"    [!] Failed to load recording: {e}")
-        return
-
-    duration = len(iq) / sample_rate
-    print(f"    {len(iq):,} samples, {duration:.1f}s, {sample_rate/1e6:.1f} MS/s")
+    verbose=False suppresses the console output. burst_lookup, if given, is
+    called as burst_lookup(freq_mhz) -> bool to decide whether a signal is
+    bursty; otherwise burstiness is inferred from the ML class.
+    """
+    log = print if verbose else (lambda *args, **kwargs: None)
 
     # --- Detect signals ---
-    print(f"\n[*] Scanning spectrum around {center_freq/1e6:.3f} MHz...")
+    log(f"\n[*] Scanning spectrum around {center_freq/1e6:.3f} MHz...")
     (freqs, freqs_hz, freqs_mhz, psd_db,
      noise_floor, threshold, peaks, props) = detect_signals(iq, sample_rate, center_freq)
 
-    print(f"    Noise floor: {noise_floor:.1f} dB")
-    print(f"    Threshold:   {threshold:.1f} dB")
-    print(f"    Signals detected: {len(peaks)}")
+    log(f"    Noise floor: {noise_floor:.1f} dB")
+    log(f"    Threshold:   {threshold:.1f} dB")
+    log(f"    Signals detected: {len(peaks)}")
 
-    # --- Initialize report ---
-    report = ScanReport(recording_path, center_freq / 1e6, sample_rate)
-    report.set_environment(noise_floor, len(peaks), duration, len(iq))
+    detections = []
 
     # --- Process each detection ---
     if len(peaks) == 0:
-        print("\n[*] No signals above threshold — band appears clear.")
+        log("\n[*] No signals above threshold — band appears clear.")
     else:
-        print(f"\n[*] Analyzing {len(peaks)} detected signal(s)...\n")
+        log(f"\n[*] Analyzing {len(peaks)} detected signal(s)...\n")
 
     for i, peak in enumerate(peaks):
         freq_mhz = freqs_mhz[peak]
@@ -194,7 +165,10 @@ def main():
         ml_confidence = float(np.max(ml_proba))
 
         # Fingerprint matching
-        is_bursty = ml_class in ["DRONE_TELEMETRY", "NARROWBAND_SIGNAL"]
+        if burst_lookup is not None:
+            is_bursty = burst_lookup(freq_mhz)
+        else:
+            is_bursty = ml_class in ["DRONE_TELEMETRY", "NARROWBAND_SIGNAL"]
         fp_match = fingerprinter.get_best_match(
             freq_mhz=freq_mhz, bandwidth_khz=bw_khz,
             is_bursty=is_bursty)
@@ -213,13 +187,13 @@ def main():
         # Print live result
         sev = assessment["severity"]
         score = assessment["threat_score"]
-        print(f"  Signal {i+1}: {freq_mhz:.3f} MHz  |  {bw_khz:.0f} kHz  |  "
+        log(f"  Signal {i+1}: {freq_mhz:.3f} MHz  |  {bw_khz:.0f} kHz  |  "
               f"ML: {ml_class} ({ml_confidence:.0%})  |  "
               f"Threat: {score}/100 ({sev})")
 
         if fp_match:
             profile, fp_score, _ = fp_match
-            print(f"           Fingerprint: {profile['name']} ({fp_score}/100)")
+            log(f"           Fingerprint: {profile['name']} ({fp_score}/100)")
 
         # Add to report
         detection_record = {
@@ -236,6 +210,40 @@ def main():
             "threat_factors": assessment["factors"],
             "recommendations": assessment["recommendations"],
         }
+        detections.append(detection_record)
+
+    return detections, noise_floor
+
+
+def load_components():
+    """Load the ML model, fingerprint DB and threat engine. Returns None if the model is missing."""
+    print("\n[*] Loading components...")
+    try:
+        clf = joblib.load("rf_classifier_model.joblib")
+        with open("rf_classifier_config.json") as f:
+            config = json.load(f)
+        print(f"    ML model loaded ({config['accuracy']:.0%} accuracy)")
+    except FileNotFoundError:
+        print("    [!] ML model not found — run train_rf_classifier.py first")
+        return None
+
+    fingerprinter = DroneFingerprinter()
+    print(f"    Fingerprint DB loaded ({len(fingerprinter.detectable)} drone profiles)")
+
+    threat_engine = ThreatEngine()
+    print(f"    Threat engine ready")
+    return clf, fingerprinter, threat_engine
+
+
+def report_scan(source, center_freq, sample_rate, num_samples,
+                detections, noise_floor, threat_engine):
+    """Print the threat summary and save JSON + text reports. Returns the filenames."""
+    duration = num_samples / sample_rate
+
+    # --- Build report ---
+    report = ScanReport(source, center_freq / 1e6, sample_rate)
+    report.set_environment(noise_floor, len(detections), duration, num_samples)
+    for detection_record in detections:
         report.add_detection(detection_record)
 
     # --- Print threat summary ---
@@ -246,6 +254,45 @@ def main():
     print(f"\n[OK] Reports saved:")
     print(f"     {json_name}")
     print(f"     {txt_name}")
+    return json_name, txt_name
+
+
+def main():
+    # --- Parse arguments ---
+    if len(sys.argv) < 3:
+        print("Usage: python rf_scanner.py <recording.wav> <center_freq_hz>")
+        print("Example: python rf_scanner.py synthetic_drone_telemetry.wav 433900000")
+        return
+
+    recording_path = sys.argv[1]
+    center_freq = float(sys.argv[2])
+
+    # --- Load components ---
+    print("=" * 60)
+    print("RTL-SDR DRONE RF THREAT SCANNER")
+    print("=" * 60)
+
+    components = load_components()
+    if components is None:
+        return
+    clf, fingerprinter, threat_engine = components
+
+    # --- Load and analyze recording ---
+    print(f"\n[*] Loading recording: {recording_path}")
+    try:
+        iq, sample_rate = load_recording(recording_path)
+    except Exception as e:
+        print(f"    [!] Failed to load recording: {e}")
+        return
+
+    duration = len(iq) / sample_rate
+    print(f"    {len(iq):,} samples, {duration:.1f}s, {sample_rate/1e6:.1f} MS/s")
+
+    detections, noise_floor = analyze_iq(iq, sample_rate, center_freq,
+                                         clf, fingerprinter, threat_engine)
+    report_scan(recording_path, center_freq, sample_rate, len(iq),
+                detections, noise_floor, threat_engine)
+
     print("\n" + "=" * 60)
     print("SCAN COMPLETE")
     print("=" * 60)
