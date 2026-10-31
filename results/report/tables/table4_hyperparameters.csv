@@ -1,0 +1,7 @@
+Model,Best hyperparameters,CV macro-F1 mean,CV macro-F1 std,Tuning time (s)
+RF (tuned),"max_depth=24, max_features=0.500, min_samples_leaf=1, n_estimators=228",0.9899611724534075,0.007780587391024146,40.598666191101074
+XGBoost,"colsample_bytree=0.912, learning_rate=0.0276, max_depth=3, min_child_weight=2, n_estimators=365, reg_lambda=1.19, subsample=0.903",0.988293593697307,0.006178800481049843,18.014522314071655
+LightGBM,"colsample_bytree=0.933, learning_rate=0.165, min_child_samples=5, n_estimators=438, num_leaves=43, reg_lambda=3.97, subsample=0.785, subsample_freq=1",0.989124448772946,0.005718833170088947,24.597826719284058
+CatBoost,"depth=4, iterations=455, l2_leaf_reg=6.00, learning_rate=0.267",0.9899900825482778,0.007744034849512018,702.9333181381226
+Ensemble (calibrated),"members=xgb + lgbm + rf (tuned params), calibration=isotonic, 5-fold, voting=soft",0.9891257544838433,0.008625795768463201,12.86725902557373
+Ensemble (uncalibrated),"members=xgb + lgbm + rf (tuned params), calibration=none, voting=soft",0.9891249701763354,0.007777799123917233,2.735992193222046

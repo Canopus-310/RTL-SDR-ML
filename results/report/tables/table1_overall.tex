@@ -1,0 +1,19 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Table 1. Overall comparison (synthetic test set, -10 to +30 dB; mean $\pm$ std over seeds)}
+\label{tab:table1_overall}
+\begin{tabular}{lrrrrrrrrrr}
+\toprule
+Model & Macro-F1 & Balanced acc. & Pd @ Pfa=1\% (LORA) & SNR for 90\% F1 (dB) & Macro-F1 0–10 dB & End-to-end 0–10 dB & Latency b1 (ms/det) & Latency b10 (ms/det) & Size (MB) & Train time (s) \\
+\midrule
+RF (tuned) & 0.844 $\pm$ 0.006 & 0.835 $\pm$ 0.007 & 0.926 $\pm$ 0.022 & -0.0626 $\pm$ 0.2284 & 0.969 $\pm$ 0.009 & 0.164 $\pm$ 0.010 & 18.9 & 1.89 & 1.80 & \textbf{0.776 $\pm$ 0.045} \\
+XGBoost & 0.859 $\pm$ 0.005 & 0.855 $\pm$ 0.007 & 0.877 $\pm$ 0.020 & 0.429 $\pm$ 0.546 & 0.966 $\pm$ 0.010 & 0.157 $\pm$ 0.010 & 0.655 & 0.101 & 2.00 & 0.840 $\pm$ 0.120 \\
+LightGBM & \textbf{0.864 $\pm$ 0.006} & \textbf{0.859 $\pm$ 0.006} & 0.907 $\pm$ 0.026 & 0.0208 $\pm$ 0.6062 & 0.966 $\pm$ 0.012 & 0.162 $\pm$ 0.009 & 0.824 & 0.233 & 2.83 & 0.844 $\pm$ 0.016 \\
+CatBoost & 0.847 $\pm$ 0.008 & 0.839 $\pm$ 0.008 & 0.928 $\pm$ 0.024 & 0.347 $\pm$ 0.824 & 0.964 $\pm$ 0.016 & 0.162 $\pm$ 0.009 & \textbf{0.280} & \textbf{0.0691} & \textbf{0.453} & 4.34 $\pm$ 0.08 \\
+Ensemble (calibrated) & 0.856 $\pm$ 0.004 & 0.849 $\pm$ 0.006 & 0.913 $\pm$ 0.018 & \textbf{-0.511 $\pm$ 0.266} & \textbf{0.974 $\pm$ 0.009} & 0.160 $\pm$ 0.012 & 128 & 5.85 & 31.5 & 11.0 $\pm$ 0.0 \\
+Ensemble (uncalibrated) & 0.861 $\pm$ 0.006 & 0.856 $\pm$ 0.007 & 0.917 $\pm$ 0.021 & 0.0309 $\pm$ 0.6137 & 0.968 $\pm$ 0.011 & 0.160 $\pm$ 0.012 & 25.2 & 3.26 & 6.64 & 2.32 $\pm$ 0.02 \\
+RF (deployed) & 0.416 $\pm$ 0.003 & 0.491 $\pm$ 0.004 & \textbf{0.961 $\pm$ 0.004} & n/a & 0.394 $\pm$ 0.006 & \textbf{0.248 $\pm$ 0.020} & 8.83 & 0.877 & 0.502 & n/a \\
+\bottomrule
+\end{tabular}
+\end{table}

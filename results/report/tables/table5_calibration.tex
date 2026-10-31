@@ -1,0 +1,19 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Table 5. Probability quality and end-to-end false alarms}
+\label{tab:table5_calibration}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Log loss & Brier score & ECE & Noise captures with a non-NOISE label \\
+\midrule
+RF (tuned) & 0.747 $\pm$ 0.088 & 0.246 $\pm$ 0.002 & \textbf{0.0780 $\pm$ 0.0070} & \textbf{0 $\pm$ 0} \\
+XGBoost & 0.614 $\pm$ 0.025 & 0.246 $\pm$ 0.012 & 0.0896 $\pm$ 0.0104 & \textbf{0 $\pm$ 0} \\
+LightGBM & 0.751 $\pm$ 0.018 & 0.243 $\pm$ 0.006 & 0.106 $\pm$ 0.005 & \textbf{0 $\pm$ 0} \\
+CatBoost & 0.690 $\pm$ 0.034 & 0.276 $\pm$ 0.013 & 0.119 $\pm$ 0.009 & \textbf{0 $\pm$ 0} \\
+Ensemble (calibrated) & 1.31 $\pm$ 0.33 & 0.238 $\pm$ 0.003 & 0.0820 $\pm$ 0.0065 & \textbf{0 $\pm$ 0} \\
+Ensemble (uncalibrated) & \textbf{0.527 $\pm$ 0.008} & \textbf{0.234 $\pm$ 0.005} & 0.0813 $\pm$ 0.0040 & \textbf{0 $\pm$ 0} \\
+RF (deployed) & 5.33 $\pm$ 0.12 & 0.670 $\pm$ 0.005 & 0.157 $\pm$ 0.004 & \textbf{0 $\pm$ 0} \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -1,0 +1,18 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Table 4. Tuned hyperparameters (30-trial random search, 5-fold stratified CV on the seed-0 training set)}
+\label{tab:table4_hyperparameters}
+\begin{tabular}{lrrr}
+\toprule
+Model & Best hyperparameters & CV macro-F1 & Tuning time (s) \\
+\midrule
+RF (tuned) & max\_depth=24, max\_features=0.500, min\_samples\_leaf=1, n\_estimators=228 & 0.990 $\pm$ 0.008 & 40.6 \\
+XGBoost & colsample\_bytree=0.912, learning\_rate=0.0276, max\_depth=3, min\_child\_weight=2, n\_estimators=365, reg\_lambda=1.19, subsample=0.903 & 0.988 $\pm$ 0.006 & 18.0 \\
+LightGBM & colsample\_bytree=0.933, learning\_rate=0.165, min\_child\_samples=5, n\_estimators=438, num\_leaves=43, reg\_lambda=3.97, subsample=0.785, subsample\_freq=1 & 0.989 $\pm$ 0.006 & 24.6 \\
+CatBoost & depth=4, iterations=455, l2\_leaf\_reg=6.00, learning\_rate=0.267 & \textbf{0.990 $\pm$ 0.008} & 703 \\
+Ensemble (calibrated) & members=xgb + lgbm + rf (tuned params), calibration=isotonic, 5-fold, voting=soft & 0.989 $\pm$ 0.009 & 12.9 \\
+Ensemble (uncalibrated) & members=xgb + lgbm + rf (tuned params), calibration=none, voting=soft & 0.989 $\pm$ 0.008 & \textbf{2.74} \\
+\bottomrule
+\end{tabular}
+\end{table}

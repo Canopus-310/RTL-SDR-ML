@@ -1,0 +1,19 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Table 3. Classifier-only macro-F1 at selected in-band SNRs}
+\label{tab:table3_f1_at_snr}
+\begin{tabular}{lrrrrr}
+\toprule
+Model & -5 dB & 0 dB & 5 dB & 10 dB & 20 dB \\
+\midrule
+RF (tuned) & 0.326 $\pm$ 0.046 & 0.914 $\pm$ 0.017 & 0.978 $\pm$ 0.016 & \textbf{1.00 $\pm$ 0.00} & \textbf{1.00 $\pm$ 0.00} \\
+XGBoost & 0.443 $\pm$ 0.083 & 0.876 $\pm$ 0.029 & 0.978 $\pm$ 0.016 & \textbf{1.00 $\pm$ 0.00} & \textbf{1.00 $\pm$ 0.00} \\
+LightGBM & \textbf{0.497 $\pm$ 0.031} & 0.915 $\pm$ 0.038 & 0.978 $\pm$ 0.016 & 0.989 $\pm$ 0.016 & \textbf{1.00 $\pm$ 0.00} \\
+CatBoost & 0.309 $\pm$ 0.043 & 0.890 $\pm$ 0.047 & 0.972 $\pm$ 0.021 & 0.994 $\pm$ 0.008 & \textbf{1.00 $\pm$ 0.00} \\
+Ensemble (calibrated) & 0.431 $\pm$ 0.065 & \textbf{0.924 $\pm$ 0.011} & \textbf{0.983 $\pm$ 0.014} & 0.994 $\pm$ 0.008 & \textbf{1.00 $\pm$ 0.00} \\
+Ensemble (uncalibrated) & 0.469 $\pm$ 0.067 & 0.915 $\pm$ 0.043 & 0.978 $\pm$ 0.016 & \textbf{1.00 $\pm$ 0.00} & \textbf{1.00 $\pm$ 0.00} \\
+RF (deployed) & 0.307 $\pm$ 0.016 & 0.329 $\pm$ 0.008 & 0.370 $\pm$ 0.016 & 0.401 $\pm$ 0.020 & 0.461 $\pm$ 0.019 \\
+\bottomrule
+\end{tabular}
+\end{table}
