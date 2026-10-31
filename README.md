@@ -107,13 +107,15 @@ python live_scan.py --loop                         # rescan until Ctrl+C
 
 Each scan discards the first 0.2 s after tuning (PLL settling and stale USB buffer data), reads in 256k-sample chunks, and writes the usual `rf_threat_report_<timestamp>.json/.txt`. Manual gain is used and the RTL2832 digital AGC is off, so levels are comparable between scans.
 
+After each scan a **stage timing table** is printed: capture (including the settle discard), detection, bandwidth + extraction, feature extraction, ML classification, fingerprinting, threat assessment and report writing (including the WAV save). Each row shows ms and % of end-to-end time, followed by two totals: processing (detection through report) and end-to-end (capture start to results printed). The per-signal stages are summed over all detected signals. The same numbers are saved under `"timings"` in the JSON report.
+
 ### Stream mode
 
 ```bash
 python live_scan.py --stream
 ```
 
-A reader thread captures 0.5 s IQ blocks into a two-block queue while the main thread analyzes them. If analysis falls behind, the oldest queued block is dropped, so the display stays within a couple of seconds of real time instead of drifting further behind. Analysis currently takes ~1.4 s per 0.5 s block with signals present (less on a quiet band), so expect to analyze roughly one block in three. The status line shows per-block processing time, lag, and dropped/read counts.
+A reader thread captures 0.5 s IQ blocks into a two-block queue while the main thread analyzes them. If analysis falls behind, the oldest queued block is dropped, so the display stays within a couple of seconds of real time instead of drifting further behind. Analysis currently takes ~1.4 s per 0.5 s block with signals present (less on a quiet band), so expect to analyze roughly one block in three. The status line shows per-block processing time with a per-stage breakdown (`det`, `bw+x`, `feat`, `ml`, `fp`, `thr`, in ms), the block's capture time, the latency from the block finishing capture to its result being printed, and dropped/read counts. The stream summary report includes mean / p95 / max for each stage.
 
 Detections are grouped into **tracks**: a detection joins the nearest track within 20 kHz. The live table shows, per track, the frequency, first/last seen, hits out of blocks spanned, presence %, burstiness and the highest threat score seen. On Ctrl+C a summary is written to `rf_threat_report_stream_<timestamp>.json/.txt`, including the highest-threat detection of each track. No per-block reports are written.
 

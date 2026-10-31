@@ -21,6 +21,7 @@ import json
 from drone_fingerprints import DroneFingerprinter
 from threat_engine import ThreatEngine
 from scan_report import ScanReport
+from stage_timer import StageTimer
 
 
 def load_recording(path):
@@ -119,7 +120,7 @@ def extract_ml_features(iq, sample_rate):
 
 
 def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
-               verbose=True, burst_lookup=None):
+               verbose=True, burst_lookup=None, timer=None):
     """
     Detect, classify, fingerprint and threat-assess every signal in an IQ capture.
 
@@ -129,14 +130,19 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
 
     verbose=False suppresses the console output. burst_lookup, if given, is
     called as burst_lookup(freq_mhz) -> bool to decide whether a signal is
-    bursty; otherwise burstiness is inferred from the ML class.
+    bursty; otherwise burstiness is inferred from the ML class. timer, if
+    given, is a StageTimer that receives the time spent in each stage.
     """
     log = print if verbose else (lambda *args, **kwargs: None)
+    if timer is None:
+        timer = StageTimer()
 
     # --- Detect signals ---
     log(f"\n[*] Scanning spectrum around {center_freq/1e6:.3f} MHz...")
-    (freqs, freqs_hz, freqs_mhz, psd_db,
-     noise_floor, threshold, peaks, props) = detect_signals(iq, sample_rate, center_freq)
+    with timer.stage("detection"):
+        (freqs, freqs_hz, freqs_mhz, psd_db,
+         noise_floor, threshold, peaks, props) = detect_signals(iq, sample_rate, center_freq)
+    timer.signals += len(peaks)
 
     log(f"    Noise floor: {noise_floor:.1f} dB")
     log(f"    Threshold:   {threshold:.1f} dB")
@@ -154,35 +160,42 @@ def analyze_iq(iq, sample_rate, center_freq, clf, fingerprinter, threat_engine,
         freq_mhz = freqs_mhz[peak]
         power = psd_db[peak]
         prominence = props["prominences"][i]
-        bw_hz, left, right = estimate_bandwidth(freqs_hz, psd_db, peak, noise_floor)
+
+        # Bandwidth + signal extraction
+        with timer.stage("extraction"):
+            bw_hz, left, right = estimate_bandwidth(freqs_hz, psd_db, peak, noise_floor)
+            sig_iq = extract_signal_iq(iq, sample_rate, freqs, peak, bw_hz)
         bw_khz = bw_hz / 1000
 
         # ML classification
-        sig_iq = extract_signal_iq(iq, sample_rate, freqs, peak, bw_hz)
-        features = extract_ml_features(sig_iq, sample_rate)
-        ml_class = clf.predict([features])[0]
-        ml_proba = clf.predict_proba([features])[0]
-        ml_confidence = float(np.max(ml_proba))
+        with timer.stage("features"):
+            features = extract_ml_features(sig_iq, sample_rate)
+        with timer.stage("ml"):
+            ml_class = clf.predict([features])[0]
+            ml_proba = clf.predict_proba([features])[0]
+            ml_confidence = float(np.max(ml_proba))
 
         # Fingerprint matching
         if burst_lookup is not None:
             is_bursty = burst_lookup(freq_mhz)
         else:
             is_bursty = ml_class in ["DRONE_TELEMETRY", "NARROWBAND_SIGNAL"]
-        fp_match = fingerprinter.get_best_match(
-            freq_mhz=freq_mhz, bandwidth_khz=bw_khz,
-            is_bursty=is_bursty)
+        with timer.stage("fingerprint"):
+            fp_match = fingerprinter.get_best_match(
+                freq_mhz=freq_mhz, bandwidth_khz=bw_khz,
+                is_bursty=is_bursty)
 
         # Threat assessment
-        assessment = threat_engine.assess({
-            "freq_mhz": freq_mhz,
-            "bandwidth_khz": bw_khz,
-            "power_db": power,
-            "ml_class": ml_class,
-            "ml_confidence": ml_confidence,
-            "fingerprint_match": fp_match,
-            "is_bursty": is_bursty,
-        })
+        with timer.stage("threat"):
+            assessment = threat_engine.assess({
+                "freq_mhz": freq_mhz,
+                "bandwidth_khz": bw_khz,
+                "power_db": power,
+                "ml_class": ml_class,
+                "ml_confidence": ml_confidence,
+                "fingerprint_match": fp_match,
+                "is_bursty": is_bursty,
+            })
 
         # Print live result
         sev = assessment["severity"]
@@ -236,21 +249,30 @@ def load_components():
 
 
 def report_scan(source, center_freq, sample_rate, num_samples,
-                detections, noise_floor, threat_engine):
-    """Print the threat summary and save JSON + text reports. Returns the filenames."""
+                detections, noise_floor, threat_engine, timer=None):
+    """
+    Print the threat summary and save JSON + text reports. Returns the filenames.
+
+    timer, if given, is a StageTimer whose "report" stage receives the time
+    spent building and saving the reports.
+    """
+    if timer is None:
+        timer = StageTimer()
     duration = num_samples / sample_rate
 
     # --- Build report ---
-    report = ScanReport(source, center_freq / 1e6, sample_rate)
-    report.set_environment(noise_floor, len(detections), duration, num_samples)
-    for detection_record in detections:
-        report.add_detection(detection_record)
+    with timer.stage("report"):
+        report = ScanReport(source, center_freq / 1e6, sample_rate)
+        report.set_environment(noise_floor, len(detections), duration, num_samples)
+        for detection_record in detections:
+            report.add_detection(detection_record)
 
     # --- Print threat summary ---
     threat_engine.summary()
 
     # --- Save reports ---
-    json_name, txt_name = report.save()
+    with timer.stage("report"):
+        json_name, txt_name = report.save()
     print(f"\n[OK] Reports saved:")
     print(f"     {json_name}")
     print(f"     {txt_name}")

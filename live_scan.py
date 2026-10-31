@@ -24,13 +24,13 @@ import os
 import queue
 import sys
 import threading
-import time
 from datetime import datetime
 
 import numpy as np
 from scipy.io import wavfile
 
 from rf_scanner import analyze_iq, load_components, report_scan
+from stage_timer import StageTimer, STAGES, stage_stats
 from threat_engine import ThreatEngine, SEVERITY_LEVELS
 
 SAMPLE_RATE = 2400000     # rate the ML model was trained at and SDR++ recorded at
@@ -45,6 +45,12 @@ TRACK_TOLERANCE_KHZ = 20  # a detection joins the nearest track within this dist
 BURST_MIN_BLOCKS = 4      # blocks a track must span before its burstiness is judged
 BURST_PRESENCE = 0.8      # present in fewer than this fraction of blocks -> bursty
 TABLE_ROWS = 20           # live table shows the top tracks by max threat
+# Per-block stages in stream mode (no per-block report), and their summary labels
+STREAM_STAGES = ["detection", "extraction", "features", "ml", "fingerprint", "threat"]
+STREAM_STAT_LABELS = {**{key: label for key, label, _ in STAGES},
+                      "capture": "Capture (block read)",
+                      "processing": "Processing (analyze_iq)",
+                      "latency": "Latency (captured -> printed)"}
 
 # libusb error codes returned by rtlsdr_open
 LIBUSB_ERROR_ACCESS = -3
@@ -155,28 +161,45 @@ def save_wav(iq, sample_rate, center_freq, when):
     return name
 
 
+def add_timings_to_report(json_name, timings):
+    """Add a "timings" section to a saved scan report (done afterwards so report writing is counted)."""
+    with open(json_name) as f:
+        report = json.load(f)
+    report["timings"] = timings
+    with open(json_name, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+
+
 def run_scan(sdr, center_freq, args, clf, fingerprinter):
-    """Capture one block of IQ, analyze it and save the reports."""
+    """Capture one block of IQ, analyze it, save the reports and print the stage timings."""
     sample_rate = int(sdr.sample_rate)
     num_samples = int(args.duration * sample_rate)
 
     print(f"\n[*] Capturing {args.duration:g}s at {center_freq/1e6:.3f} MHz...")
-    read_iq(sdr, int(SETTLE_SECONDS * sample_rate))  # discarded
-    started = datetime.now()
-    iq = read_iq(sdr, num_samples)
+    timer = StageTimer()  # end-to-end clock starts at capture start
+    with timer.stage("capture"):
+        read_iq(sdr, int(SETTLE_SECONDS * sample_rate))  # discarded
+        started = datetime.now()
+        iq = read_iq(sdr, num_samples)
     print(f"    {len(iq):,} samples, {len(iq)/sample_rate:.1f}s, {sample_rate/1e6:.1f} MS/s")
 
     source = f"live RTL-SDR capture ({started:%Y-%m-%d %H:%M:%S})"
     if args.save_wav:
-        source = save_wav(iq, sample_rate, center_freq, started)
+        with timer.stage("report"):
+            source = save_wav(iq, sample_rate, center_freq, started)
         print(f"    IQ saved: {source}")
 
     # Fresh engine per scan so the summary only covers this capture
     threat_engine = ThreatEngine()
     detections, noise_floor = analyze_iq(iq, sample_rate, center_freq,
-                                         clf, fingerprinter, threat_engine)
-    report_scan(source, center_freq, sample_rate, len(iq),
-                detections, noise_floor, threat_engine)
+                                         clf, fingerprinter, threat_engine, timer=timer)
+    json_name, _ = report_scan(source, center_freq, sample_rate, len(iq),
+                               detections, noise_floor, threat_engine, timer=timer)
+    end_to_end_ms = timer.elapsed_ms()
+
+    add_timings_to_report(json_name, timer.as_dict(end_to_end_ms))
+    print("\n[*] Stage timings")
+    print(timer.format_table(end_to_end_ms))
 
 
 class BlockReader(threading.Thread):
@@ -191,15 +214,21 @@ class BlockReader(threading.Thread):
         self.stop_event = threading.Event()
         self.blocks_read = 0
         self.blocks_dropped = 0
+        self.settle_ms = None
         self.error = None
 
     def run(self):
         try:
-            read_iq(self.sdr, self.settle_samples)  # discarded
+            settle = StageTimer()
+            with settle.stage("capture"):
+                read_iq(self.sdr, self.settle_samples)  # discarded
+            self.settle_ms = settle.ms["capture"]
             while not self.stop_event.is_set():
-                iq = read_iq(self.sdr, self.block_samples)
+                capture = StageTimer()
+                with capture.stage("capture"):
+                    iq = read_iq(self.sdr, self.block_samples)
                 self.blocks_read += 1
-                block = (datetime.now(), iq)
+                block = (datetime.now(), iq, capture.ms["capture"])
                 try:
                     self.blocks.put_nowait(block)
                 except queue.Full:
@@ -365,6 +394,13 @@ def save_stream_summary(tracker, stream, metadata):
                 f"({metadata['block_seconds']:g}s each)\n")
         f.write(f"Processing:   {stream['processing_ms_avg']:.0f} ms avg, "
                 f"{stream['processing_ms_max']:.0f} ms max per block\n\n")
+        f.write("STAGE TIMINGS PER ANALYZED BLOCK (ms)\n")
+        f.write(f"  {'Stage':<32}{'Mean':>9}{'P95':>9}{'Max':>9}\n")
+        f.write("  " + "-" * 59 + "\n")
+        for key, s in stream["timings"].items():
+            f.write(f"  {STREAM_STAT_LABELS[key]:<32}{s['mean_ms']:>9.1f}"
+                    f"{s['p95_ms']:>9.1f}{s['max_ms']:>9.1f}\n")
+        f.write("  Per-signal stages are summed over the signals in each block.\n\n")
         f.write(f"Overall:           {summary['overall_assessment']}\n")
         f.write(f"Max Threat Score:  {summary['max_threat_score']}/100\n")
         f.write(f"Tracks:            {summary['tracks']}\n")
@@ -394,6 +430,7 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
     clf.n_jobs = 1
     tracker = SignalTracker()
     processing_ms = []
+    block_timings = []  # per analyzed block: {stage: ms, "processing": ms, "latency": ms}
     live = enable_ansi()
     started = datetime.now()
 
@@ -404,31 +441,42 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
         while True:
             try:
                 # Short timeout keeps Ctrl+C responsive on Windows
-                captured_at, iq = reader.blocks.get(timeout=0.5)
+                captured_at, iq, capture_ms = reader.blocks.get(timeout=0.5)
             except queue.Empty:
                 if reader.error is not None:
                     raise reader.error
                 continue
 
-            t0 = time.perf_counter()
+            timer = StageTimer()  # processing clock starts here
+            timer.add("capture", capture_ms)
             detections, noise_floor = analyze_iq(
                 iq, sample_rate, center_freq, clf, fingerprinter, ThreatEngine(),
-                verbose=False, burst_lookup=tracker.is_bursty)
-            processing_ms.append(1000 * (time.perf_counter() - t0))
+                verbose=False, burst_lookup=tracker.is_bursty, timer=timer)
+            processing_ms.append(timer.elapsed_ms())
             tracker.update(detections, captured_at)
-            lag = (datetime.now() - captured_at).total_seconds()
 
+            screen = []
             if live:
-                sys.stdout.write("\033[H\033[J")  # redraw in place
-                print(f"RTL-SDR STREAM  {center_freq/1e6:.3f} MHz  gain {gain:.1f} dB  "
-                      f"started {started:%H:%M:%S}  (Ctrl+C to stop)\n")
-            print(f"Block {tracker.blocks_analyzed}: {processing_ms[-1]:.0f} ms "
-                  f"(avg {np.mean(processing_ms):.0f}, max {max(processing_ms):.0f}; "
-                  f"budget {BLOCK_SECONDS * 1000:.0f})  |  lag {lag:.1f}s  |  "
-                  f"dropped {reader.blocks_dropped}/{reader.blocks_read}  |  "
-                  f"noise {noise_floor:.1f} dB  |  {len(detections)} detections")
-            print(format_track_table(tracker, TABLE_ROWS))
+                screen.append("\033[H\033[J")  # redraw in place
+                screen.append(f"RTL-SDR STREAM  {center_freq/1e6:.3f} MHz  gain {gain:.1f} dB  "
+                              f"started {started:%H:%M:%S}  (Ctrl+C to stop)\n\n")
+            table = format_track_table(tracker, TABLE_ROWS)
+            # Latency is taken once the output is ready, just before it is written
+            latency_ms = 1000 * (datetime.now() - captured_at).total_seconds()
+            screen.append(
+                f"Block {tracker.blocks_analyzed}: {processing_ms[-1]:.0f} ms "
+                f"[{timer.compact(STREAM_STAGES)}] "
+                f"(avg {np.mean(processing_ms):.0f}, max {max(processing_ms):.0f}; "
+                f"budget {BLOCK_SECONDS * 1000:.0f})  |  capture {capture_ms:.0f} ms  |  "
+                f"latency {latency_ms / 1000:.2f}s  |  "
+                f"dropped {reader.blocks_dropped}/{reader.blocks_read}  |  "
+                f"noise {noise_floor:.1f} dB  |  {len(detections)} detections\n")
+            screen.append(table + "\n")
+            sys.stdout.write("".join(screen))
             sys.stdout.flush()
+
+            block_timings.append({**{key: timer.ms[key] for key in ["capture"] + STREAM_STAGES},
+                                  "processing": processing_ms[-1], "latency": latency_ms})
     except KeyboardInterrupt:
         print("\n[*] Stopped by user (Ctrl+C).")
     finally:
@@ -444,6 +492,8 @@ def run_stream(sdr, reader, center_freq, clf, fingerprinter):
                 "blocks_dropped": reader.blocks_dropped,
                 "processing_ms_avg": round(float(np.mean(processing_ms)), 1),
                 "processing_ms_max": round(max(processing_ms), 1),
+                "settle_ms": None if reader.settle_ms is None else round(reader.settle_ms, 1),
+                "timings": stage_stats(block_timings),
             }
             metadata = {
                 "tool": "RTL-SDR Drone RF Signal Classifier",
